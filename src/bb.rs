@@ -295,6 +295,8 @@ impl Bitboard {
 }
 
 impl mcts::MctsState for Bitboard {
+    type Move = usize;
+
     fn init() -> Self {
         Self::new()
     }
@@ -307,11 +309,11 @@ impl mcts::MctsState for Bitboard {
         self.mcts_rollout()
     }
 
-    fn children(&self) -> impl Iterator<Item = Self> {
+    fn children(&self) -> impl Iterator<Item = (Self::Move, Self)> {
         let BitboardSet(empty) = self.empty();
         (0..121)
             .filter(move |i| empty & (1 << i) != 0)
-            .map(|i| self.nth_child(i))
+            .map(|i| (i, self.nth_child(i)))
     }
 }
 

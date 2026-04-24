@@ -9,28 +9,30 @@ const PRINT_INTERVAL: Duration = Duration::from_millis(200);
 const EXPLORE: f32 = f32::consts::SQRT_2;
 
 pub trait MctsState: Sized {
+    type Move: Copy + PartialEq;
+
     fn init() -> Self;
 
     fn terminal(&self) -> Option<bool>;
 
     fn rollout(&self) -> bool;
 
-    fn children(&self) -> impl Iterator<Item = Self>;
+    fn children(&self) -> impl Iterator<Item = (Self::Move, Self)>;
 }
 
-pub struct MctsTree<S> {
+pub struct MctsTree<S: MctsState> {
     last_print: Instant,
     root_depth: usize,
     root: MctsNode<S>,
 }
 
-enum MctsChildren<S> {
+enum MctsChildren<S: MctsState> {
     Unknown,
     Leaf(bool),
-    List(Vec<MctsNode<S>>),
+    List(Vec<(S::Move, MctsNode<S>)>),
 }
 
-struct MctsNode<S> {
+struct MctsNode<S: MctsState> {
     state: S,
     sente_wins: usize,
     rollouts: usize,
@@ -75,18 +77,14 @@ impl<S: MctsState> MctsTree<S> {
         }
     }
 
-    pub fn into_best(mut self) -> Result<Self, Self> {
-        match self.root.into_best(self.root_depth) {
-            Ok(root) => {
-                self.root = root;
-                self.root_depth += 1;
-                Ok(self)
-            }
-            Err(root) => {
-                self.root = root;
-                Err(self)
-            }
-        }
+    pub fn best(&self) -> Option<S::Move> {
+        self.root.best(self.root_depth)
+    }
+
+    pub fn into_move(mut self, mv: S::Move) -> Self {
+        self.root = self.root.into_move(mv);
+        self.root_depth += 1;
+        self
     }
 }
 
@@ -123,8 +121,12 @@ impl<S: MctsState> MctsNode<S> {
     fn iter(&mut self, depth: usize) {
         match self.children {
             MctsChildren::Unknown => {
-                self.children =
-                    MctsChildren::List(self.state.children().map(MctsNode::new).collect());
+                let children = self
+                    .state
+                    .children()
+                    .map(|(m, s)| (m, MctsNode::new(s)))
+                    .collect();
+                self.children = MctsChildren::List(children);
             }
             MctsChildren::Leaf(sente_win) => {
                 self.sente_wins += sente_win as usize;
@@ -133,9 +135,9 @@ impl<S: MctsState> MctsNode<S> {
             }
             MctsChildren::List(ref mut children) => {
                 let ln_n = (self.rollouts as f32).ln();
-                let child = children
+                let (_, child) = children
                     .iter_mut()
-                    .max_by_key(|c| c.uct(depth, ln_n, EXPLORE))
+                    .max_by_key(|(_, c)| c.uct(depth, ln_n, EXPLORE))
                     .expect("no children");
                 child.iter(depth + 1);
             }
@@ -145,24 +147,44 @@ impl<S: MctsState> MctsNode<S> {
         };
         self.sente_wins = 0;
         self.rollouts = 0;
-        for child in children.iter() {
+        for (_, child) in children.iter() {
             self.sente_wins += child.sente_wins;
             self.rollouts += child.rollouts;
         }
     }
 
-    fn into_best(self, depth: usize) -> Result<Self, Self> {
+    fn best(&self, depth: usize) -> Option<S::Move> {
         let ln_n = (self.rollouts as f32).ln();
         let children = match self.children {
             MctsChildren::Unknown => panic!(),
-            MctsChildren::Leaf(_) => return Err(self),
-            MctsChildren::List(children) => children,
+            MctsChildren::Leaf(_) => return None,
+            MctsChildren::List(ref children) => children,
         };
-        let child = children
+        let (mv, _) = children
             .into_iter()
-            .max_by_key(|c| c.uct(depth, ln_n, 0.0))
-            .expect("no children");
-        Ok(child)
+            .max_by_key(|(_, c)| c.uct(depth, ln_n, 0.0))?;
+        Some(*mv)
+    }
+
+    fn into_move(self, mv: S::Move) -> Self {
+        match self.children {
+            MctsChildren::Unknown => {
+                let (_, child) = self
+                    .state
+                    .children()
+                    .find(|(m, _)| *m == mv)
+                    .expect("no move");
+                MctsNode::new(child)
+            }
+            MctsChildren::Leaf(_) => panic!(),
+            MctsChildren::List(children) => {
+                let (_, child) = children
+                    .into_iter()
+                    .find(|(m, _)| *m == mv)
+                    .expect("no move");
+                child
+            }
+        }
     }
 }
 
