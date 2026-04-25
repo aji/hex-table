@@ -271,6 +271,28 @@ impl Bitboard {
         }
     }
 
+    pub fn rc(&self, r: usize, c: usize) -> Option<bool> {
+        let mask = 1 << (120 - r * 11 - c);
+        let b = (self.black & mask) != 0;
+        let w = (self.white & mask) != 0;
+        match (b, w) {
+            (true, _) => Some(true),
+            (false, true) => Some(false),
+            (false, false) => None,
+        }
+    }
+
+    pub fn with_move(mut self, r: usize, c: usize) -> Bitboard {
+        let mask = 1 << (120 - r * 11 - c);
+        match self.sente() {
+            true => self.black |= mask,
+            false => self.white |= mask,
+        }
+        self.black ^= NEXT_MOVE;
+        self.white ^= NEXT_MOVE;
+        self
+    }
+
     pub fn mcts_rollout(&self) -> bool {
         let BitboardSet(empty) = self.empty();
         // this is not strictly correct because (mask & empty) and (!mask &
@@ -327,12 +349,7 @@ impl mcts2::MctsState for Bitboard {
     }
 
     fn rollout(&self) -> bool {
-        let wins = (self.mcts_rollout() as u8)
-            + (self.mcts_rollout() as u8)
-            + (self.mcts_rollout() as u8)
-            + (self.mcts_rollout() as u8)
-            + (self.mcts_rollout() as u8);
-        wins >= 3
+        self.mcts_rollout()
     }
 
     fn children(&self) -> impl ExactSizeIterator<Item = Self> {

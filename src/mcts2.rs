@@ -178,7 +178,7 @@ pub fn search<S: MctsState, M: MctsMonitor<S>>(state: S, depth: usize, mut monit
             max_depth = max_depth.max(stat_depth);
         }
 
-        if last_defer.elapsed().as_millis() > 40 {
+        if last_defer.elapsed().as_millis() > 100 {
             let stats = MctsStats {
                 num_wins: root.num_wins,
                 num_sims: root.num_sims,
