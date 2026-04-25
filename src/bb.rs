@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use crate::mcts;
+use crate::{mcts, mcts2};
 
 const fn mask(
     r11: u128,
@@ -241,8 +241,8 @@ pub struct BitboardSet(u128);
 /// The main bitboard struct. Implements `Copy` and most functions are `self`
 #[derive(Copy, Clone)]
 pub struct Bitboard {
-    black: u128,
-    white: u128,
+    pub black: u128,
+    pub white: u128,
 }
 
 impl Bitboard {
@@ -317,6 +317,34 @@ impl mcts::MctsState for Bitboard {
     }
 }
 
+impl mcts2::MctsState for Bitboard {
+    fn init() -> Self {
+        Self::new()
+    }
+
+    fn terminal(&self) -> Option<bool> {
+        self.win()
+    }
+
+    fn rollout(&self) -> bool {
+        let wins = (self.mcts_rollout() as u8)
+            + (self.mcts_rollout() as u8)
+            + (self.mcts_rollout() as u8)
+            + (self.mcts_rollout() as u8)
+            + (self.mcts_rollout() as u8);
+        wins >= 3
+    }
+
+    fn children(&self) -> impl ExactSizeIterator<Item = Self> {
+        let BitboardSet(empty) = self.empty();
+        (0..121)
+            .filter(move |i| empty & (1 << i) != 0)
+            .map(|i| self.nth_child(i))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+}
+
 pub struct BitboardPretty<'b>(pub &'b Bitboard);
 
 const FILES: &'static str = "abcdefghijk";
@@ -335,21 +363,21 @@ impl fmt::Display for BitboardPretty<'_> {
             for _ in 0..i {
                 write!(f, "  ")?;
             }
-            write!(f, "{:2}  ", i + 1)?;
+            write!(f, "{:2} ", i + 1)?;
             for j in 0..11 {
                 if j != 0 {
-                    write!(f, "   ")?;
+                    write!(f, " ")?;
                 }
                 let mask = 1 << (120 - i * 11 - j);
                 if b.black & mask != 0 {
-                    write!(f, "\x1b[41mX\x1b[0m")?;
+                    write!(f, "\x1b[41m X \x1b[0m")?;
                 } else if b.white & mask != 0 {
-                    write!(f, "\x1b[44mO\x1b[0m")?;
+                    write!(f, "\x1b[44m O \x1b[0m")?;
                 } else {
-                    write!(f, ".")?;
+                    write!(f, " . ")?;
                 }
             }
-            writeln!(f, "  {:<2}", i + 1)?;
+            writeln!(f, " {:<2}", i + 1)?;
         }
         write!(f, "                        ")?;
         for j in 0..11 {
