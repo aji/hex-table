@@ -28,10 +28,13 @@ pub trait Monitor {
 
 impl<F> Monitor for F
 where
-    F: Fn(Stats) -> ControlFlow<()>,
+    F: Fn(usize) -> bool,
 {
     fn defer(&self, stats: Stats) -> ControlFlow<()> {
-        (self)(stats)
+        match (self)(stats.iters) {
+            true => ControlFlow::Continue(()),
+            false => ControlFlow::Break(()),
+        }
     }
 }
 

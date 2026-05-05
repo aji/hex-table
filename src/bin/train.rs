@@ -2,7 +2,10 @@
 
 use std::{
     ops::ControlFlow,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
+    },
     time::{Duration, Instant},
 };
 
@@ -12,15 +15,18 @@ use burn::{
         GradientsParams, Optimizer, SgdConfig, decay::WeightDecayConfig, momentum::MomentumConfig,
     },
     record::Record,
-    tensor::backend::Backend,
+    tensor::{Transaction, backend::Backend},
 };
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
     mcts2,
     nn::{
-        model::{Model, ModelConfig, ModelRecord, ModelRecordItem, examples_to_input},
-        search::{Stats, search},
-        transform::{Transform, Transpose},
+        constants::*,
+        model::{
+            Model, ModelConfig, ModelRecord, ModelRecordItem, boards_to_tensor, examples_to_input,
+        },
+        search::{Evaluator, search_with_evaluator},
+        transform::{Transform, Transforms, Transpose},
     },
 };
 use rand::seq::IndexedRandom;
@@ -29,21 +35,26 @@ type Prec = burn::record::FullPrecisionSettings;
 type Back = burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>;
 type Dev = <Back as Backend>::Device;
 
+const BATCH_EVALS: usize = 32;
+const SELF_PLAY_CONCURRENCY: usize = 128;
+
 #[derive(Clone)]
 struct Context {
     config: ModelConfig,
     latest: Arc<RwLock<ModelRecordItem<Back, Prec>>>,
     examples: Arc<RwLock<ExampleBuffer>>,
+    evaluator: Sender<EvalRequest>,
 }
 
 impl Context {
-    fn new(cf: ModelConfig) -> Self {
+    fn new(cf: ModelConfig, evaluator: Sender<EvalRequest>) -> Self {
         let model = cf.init::<Back>(&Default::default());
         let item = model.into_record().into_item();
         Context {
             config: cf,
             latest: Arc::new(RwLock::new(item)),
             examples: Arc::new(RwLock::new(ExampleBuffer::new())),
+            evaluator,
         }
     }
 
@@ -63,12 +74,8 @@ impl Context {
         *self.latest.write().unwrap() = item;
     }
 
-    fn save_examples<I>(&self, it: I)
-    where
-        I: Iterator<Item = Example>,
-    {
-        let mut examples = self.examples.write().unwrap();
-        it.for_each(|x| examples.push(x));
+    fn num_examples(&self) -> usize {
+        self.examples.read().unwrap().examples.len()
     }
 
     fn load_examples(&self, count: usize) -> Vec<Example> {
@@ -79,6 +86,57 @@ impl Context {
             .sample(&mut rand::rng(), count)
             .cloned()
             .collect()
+    }
+
+    fn play<F>(&self, mover: F)
+    where
+        F: Fn(Bitboard) -> (Bitboard, Vec<f32>),
+    {
+        let transpose = Transpose::new();
+
+        let mut board = Bitboard::new();
+        let mut log: Vec<(Bitboard, Vec<f32>)> = Vec::new();
+        while board.win().is_none() {
+            let (next_board, policy) = mover(board);
+            log.push((board, policy));
+            board = next_board;
+        }
+
+        let value = match board.win() {
+            Some(true) => 1.0,
+            Some(false) => -1.0,
+            None => panic!(),
+        };
+
+        let mut examples = self.examples.write().unwrap();
+        for (board, policy) in log.into_iter() {
+            let example = match board.sente() {
+                true => Example {
+                    board,
+                    policy,
+                    value,
+                },
+                false => Example {
+                    board: transpose.apply_board(board),
+                    policy: transpose.apply_policy(policy),
+                    value: transpose.apply_value(value),
+                },
+            };
+            examples.push(example);
+        }
+    }
+}
+
+struct BatchEvaluator<'a>(&'a Context);
+
+impl<'a> Evaluator for BatchEvaluator<'a> {
+    fn call(&self, board: Bitboard) -> (Vec<f32>, f32) {
+        let (send, recv) = sync_channel(1);
+        self.0
+            .evaluator
+            .send(EvalRequest::Board(board, send))
+            .unwrap();
+        recv.recv().unwrap()
     }
 }
 
@@ -104,8 +162,6 @@ impl ExampleBuffer {
             self.examples[self.next] = example;
             self.next = (self.next + 1) % self.capacity;
         }
-        //println!("\x1b[15H\x1b[Khave {} examples", self.examples.len());
-        println!("have {} examples", self.examples.len());
     }
 }
 
@@ -116,65 +172,107 @@ struct Example {
     value: f32,
 }
 
-fn self_play(ctx: Context) {
+enum EvalRequest {
+    Board(Bitboard, SyncSender<(Vec<f32>, f32)>),
+}
+
+struct PendingEval {
+    board: Bitboard,
+    tf: Transforms,
+    ret: SyncSender<(Vec<f32>, f32)>,
+}
+
+fn evaluator(ctx: Context, inbox: Receiver<EvalRequest>) {
     let device = Default::default();
     let mut model = ctx.init(&device);
-    let transpose = Transpose::new();
+    let mut last_update = Instant::now();
 
-    for iter in 0.. {
-        let mut board = Bitboard::new();
-        let mut depth = 0;
-        let mut log: Vec<(Bitboard, Vec<f32>)> = Vec::new();
-        while board.win().is_none() {
-            //println!("\x1b[H{}iter={iter}", BitboardPretty(&board));
-            println!("{}\niter={iter}", BitboardPretty(&board));
-            if iter < 200 {
-                let out = mcts2::search(board, depth, |stats: &mcts2::MctsStats<Bitboard>| {
-                    match stats.num_sims > 20000 {
-                        true => ControlFlow::Break(()),
-                        false => ControlFlow::Continue(()),
-                    }
-                });
-                log.push((out.best, out.policy));
-                board = out.best;
-            } else {
-                model = ctx.load_latest(model, &device);
-                let model = model.valid();
-                let num_iters = match iter < 400 {
-                    true => 100,
-                    false => 600,
-                };
-                let out = search(&model, &device, board, |stats: Stats| {
-                    match stats.iters > num_iters {
-                        true => ControlFlow::Break(()),
-                        false => ControlFlow::Continue(()),
-                    }
-                });
-                log.push((board, out.policy));
-                board = out.board_sample;
-            }
-            depth = depth + 1;
+    let mut pending: Vec<PendingEval> = Vec::new();
+
+    loop {
+        let EvalRequest::Board(board, ret) = inbox.recv().unwrap();
+        let mut tf = Transforms::new();
+        if !board.sente() {
+            tf.push(Transpose::new());
+        }
+        pending.push(PendingEval { board, tf, ret });
+
+        if pending.len() < BATCH_EVALS {
+            continue;
         }
 
-        let value = match board.win() {
-            Some(true) => 1.0,
-            Some(false) => -1.0,
-            None => panic!(),
-        };
+        if last_update.elapsed() > Duration::from_millis(1000) {
+            model = ctx.load_latest(model, &device);
+            last_update = Instant::now();
+        }
 
-        let examples = log.into_iter().map(|(board, policy)| match board.sente() {
-            true => Example {
-                board,
-                policy,
-                value,
-            },
-            false => Example {
-                board: transpose.apply_board(board),
-                policy: transpose.apply_policy(policy),
-                value: transpose.apply_value(value),
-            },
+        let model = model.valid();
+        let batch = std::mem::take(&mut pending);
+        let boards: Vec<Bitboard> = batch.iter().map(|x| x.tf.apply_board(x.board)).collect();
+        let boards_ten = boards_to_tensor(boards.iter().copied(), &device);
+
+        let (policy, value) = model.forward(boards_ten);
+        let [policy, value] = Transaction::default()
+            .register(policy)
+            .register(value)
+            .execute()
+            .try_into()
+            .expect("wrong tensor count");
+        let policy = policy.into_vec().unwrap();
+        let value = value.into_vec().unwrap();
+
+        for (i, x) in batch.iter().enumerate() {
+            let i0 = i * BOARD_SIZE;
+            let i1 = (i + 1) * BOARD_SIZE;
+
+            let policy = x.tf.unapply_policy(policy[i0..i1].to_vec());
+            let value = x.tf.unapply_value(value[i]);
+
+            x.ret.send((policy, value)).unwrap();
+        }
+    }
+}
+
+fn prefill(ctx: Context) {
+    let n = 200;
+    let mut last_print = Instant::now();
+    for i in 0..n {
+        if last_print.elapsed().as_millis() > 200 {
+            println!("n={} prefill {}% complete", ctx.num_examples(), i * 100 / n);
+            last_print = Instant::now();
+        }
+        ctx.play(|board| {
+            let depth = board.depth();
+            let out = mcts2::search(board, depth, |stats: &mcts2::MctsStats<Bitboard>| {
+                match stats.num_sims > 50000 {
+                    true => ControlFlow::Break(()),
+                    false => ControlFlow::Continue(()),
+                }
+            });
+            (out.best, out.policy)
+        })
+    }
+    println!("prefill completed");
+}
+
+fn self_play(idx: usize, ctx: Context) {
+    loop {
+        ctx.play(|board| {
+            if board.depth() % 10 == 0 {
+                println!(
+                    "n={} self play {idx:03} move {:3}",
+                    ctx.num_examples(),
+                    board.depth()
+                );
+            }
+            let limit = 200 + 5 * idx;
+            let eval = BatchEvaluator(&ctx);
+            let out = search_with_evaluator(&eval, board, |n: usize| n < limit);
+            if idx == SELF_PLAY_CONCURRENCY - 1 {
+                println!("{}", BitboardPretty(&out.board_sample));
+            }
+            (out.board_sample, out.policy)
         });
-        ctx.save_examples(examples);
     }
 }
 
@@ -189,49 +287,62 @@ fn optimizer(ctx: Context) {
 
     let mut last_print = Instant::now();
 
-    loop {
+    for iter in 0.. {
         let examples = loop {
-            let examples = ctx.load_examples(1000);
-            if examples.len() >= 1000 {
+            let examples = ctx.load_examples(256);
+            if examples.len() >= 256 {
                 break examples_to_input(
                     examples.into_iter().map(|e| (e.board, e.policy, e.value)),
                     &device,
                 );
             }
-            //println!("\x1b[16H\x1b[Knot enough examples for optimizer. waiting a bit");
-            println!("not enough examples for optimizer. waiting a bit");
-            std::thread::sleep(Duration::from_secs(5));
+            println!("optimizer waiting a bit");
+            std::thread::sleep(Duration::from_millis(500));
         };
 
         let loss = model.forward_loss(examples);
         if last_print.elapsed() > Duration::from_millis(500) {
-            //println!("\x1b[16H\x1b[Kloss={:?}", loss.clone().into_scalar());
-            println!("loss={:?}", loss.clone().into_scalar());
+            println!(
+                "iter={iter:?} loss={:10.8?} params={:?}",
+                loss.clone().into_scalar(),
+                model.num_params()
+            );
             last_print = Instant::now();
         }
 
         let grad = loss.backward();
         let grad = GradientsParams::from_grads(grad, &model);
-        model = optim.step(1e-2, model, grad);
+        model = optim.step(3e-2, model, grad);
 
         ctx.save_latest(&model);
     }
 }
 
 fn main() {
-    let ctx = Context::new(ModelConfig::new(8, 4, 64));
+    let (eval_send, eval_recv) = channel();
+    let ctx = Context::new(ModelConfig::new(12, 16, 64), eval_send);
 
-    println!("\x1b[H\x1b[J");
-
-    let play_thread = std::thread::spawn({
+    let eval_thread = std::thread::spawn({
         let ctx = ctx.clone();
-        move || self_play(ctx)
+        move || evaluator(ctx, eval_recv)
+    });
+    let prefill_thread = std::thread::spawn({
+        let ctx = ctx.clone();
+        move || prefill(ctx)
     });
     let opt_thread = std::thread::spawn({
         let ctx = ctx.clone();
         move || optimizer(ctx)
     });
 
-    play_thread.join().unwrap();
+    for i in 0..SELF_PLAY_CONCURRENCY {
+        std::thread::spawn({
+            let ctx = ctx.clone();
+            move || self_play(i, ctx)
+        });
+    }
+
+    prefill_thread.join().unwrap();
+    eval_thread.join().unwrap();
     opt_thread.join().unwrap();
 }

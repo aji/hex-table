@@ -3,10 +3,7 @@ use std::ops::ControlFlow;
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
     mcts2,
-    nn::{
-        self,
-        search::{Evaluator, Stats},
-    },
+    nn::{self, search::Evaluator},
 };
 
 pub fn main() {
@@ -18,12 +15,7 @@ pub fn main() {
                 break;
             }
             let out =
-                nn::search::search_with_evaluator(&MctsEval, board, |stats: Stats| {
-                    match stats.iters > 1200 {
-                        true => ControlFlow::Break(()),
-                        false => ControlFlow::Continue(()),
-                    }
-                });
+                nn::search::search_with_evaluator(&MctsEval, board, |iters: usize| iters < 1200);
             board = out.board_sample;
         }
         println!("GAME OVER\n\n\n");
