@@ -43,3 +43,71 @@ impl fmt::Display for SizePretty {
         f.pad(s.as_str())
     }
 }
+
+#[derive(Copy, Clone, PartialOrd, PartialEq)]
+pub struct Finite(f64);
+
+impl From<f64> for Finite {
+    fn from(value: f64) -> Self {
+        debug_assert!(value.is_finite());
+        Self(value)
+    }
+}
+
+impl Eq for Finite {}
+
+impl Ord for Finite {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+pub trait IteratorExt: Iterator {
+    fn argmax(self) -> Option<usize>
+    where
+        Self: Sized,
+        Self::Item: Ord + Clone,
+    {
+        self.enumerate()
+            .max_by_key(|(_, x)| x.clone())
+            .map(|(i, _)| i)
+    }
+
+    fn cumsum(self) -> CumSum<Self>
+    where
+        Self: Sized,
+        Self::Item: std::ops::Add<Output = Self::Item> + Clone,
+    {
+        CumSum {
+            inner: self,
+            total: None,
+        }
+    }
+}
+
+impl<I: Iterator> IteratorExt for I {}
+
+pub struct CumSum<I: Iterator> {
+    inner: I,
+    total: Option<I::Item>,
+}
+
+impl<I: Iterator> Iterator for CumSum<I>
+where
+    I::Item: std::ops::Add<Output = I::Item> + Clone,
+{
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(total) = self.total.clone() {
+            if let Some(next) = self.inner.next() {
+                self.total = Some(total + next);
+            } else {
+                return None;
+            }
+        } else {
+            self.total = self.inner.next();
+        };
+        return self.total.clone();
+    }
+}

@@ -2,6 +2,8 @@ use std::{ops::ControlFlow, time::Instant};
 
 use bumpalo::Bump;
 
+use crate::util::Finite;
+
 pub trait MctsState: Copy + Sized {
     fn init() -> Self;
 
@@ -199,22 +201,4 @@ pub fn search<S: MctsState, M: MctsMonitor<S>>(state: S, depth: usize, mut monit
     }
 
     root.best()
-}
-
-#[derive(Copy, Clone, PartialOrd, PartialEq)]
-struct Finite(f64);
-
-impl From<f64> for Finite {
-    fn from(value: f64) -> Self {
-        debug_assert!(value.is_finite());
-        Self(value)
-    }
-}
-
-impl Eq for Finite {}
-
-impl Ord for Finite {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap()
-    }
 }

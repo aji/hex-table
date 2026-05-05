@@ -271,8 +271,27 @@ impl Bitboard {
         }
     }
 
-    pub fn rc(&self, r: usize, c: usize) -> Option<bool> {
-        let mask = 1 << (120 - r * 11 - c);
+    pub fn transpose(&self) -> Bitboard {
+        let mut board = Bitboard {
+            black: (self.black & NEXT_MOVE) ^ NEXT_MOVE,
+            white: (self.white & NEXT_MOVE) ^ NEXT_MOVE,
+        };
+        for r in 0..11 {
+            for c in 0..11 {
+                let mask = 1 << 120 - c * 11 - r;
+                match self.rc(r, c) {
+                    Some(true) => board.white |= mask,
+                    Some(false) => board.black |= mask,
+                    _ => (),
+                }
+            }
+        }
+        board
+    }
+
+    pub fn idx(&self, i: usize) -> Option<bool> {
+        assert!(i < 121);
+        let mask = 1 << 120 - i;
         let b = (self.black & mask) != 0;
         let w = (self.white & mask) != 0;
         match (b, w) {
@@ -280,6 +299,11 @@ impl Bitboard {
             (false, true) => Some(false),
             (false, false) => None,
         }
+    }
+
+    pub fn rc(&self, r: usize, c: usize) -> Option<bool> {
+        assert!(r < 11 && c < 11);
+        self.idx(r * 11 + c)
     }
 
     pub fn with_move(mut self, r: usize, c: usize) -> Bitboard {
@@ -303,9 +327,14 @@ impl Bitboard {
         bb_fill(BLACK_START, black) & BLACK_END != 0
     }
 
+    pub fn nth_child_valid(&self, n: usize) -> bool {
+        let mask = 1 << 120 - n;
+        (self.black | self.white) & mask == 0
+    }
+
     /// NOTE: this function does not check if the given move is valid!
-    fn nth_child(mut self, n: usize) -> Bitboard {
-        let mask = 1 << n;
+    pub fn nth_child(mut self, n: usize) -> Bitboard {
+        let mask = 1 << 120 - n;
         match self.sente() {
             true => self.black |= mask,
             false => self.white |= mask,

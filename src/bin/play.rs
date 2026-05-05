@@ -1,12 +1,13 @@
 use ggez::{
     Context, ContextBuilder, GameError, GameResult,
     conf::WindowMode,
-    event::{EventHandler, MouseButton},
+    event::EventHandler,
     glam::{Affine2, Vec2},
     graphics::{Canvas, Color, DrawMode, DrawParam, Mesh, Rect, Text, TextLayout},
+    winit::event::MouseButton,
 };
 use hex_table::{
-    agent::{Agent, MctsAgent, ThinkHandle},
+    agent::{Agent, ThinkHandle, mcts_thinking_task},
     bb::{Bitboard, BitboardPretty},
 };
 
@@ -87,7 +88,7 @@ impl BoardGeom {
 }
 
 struct MainState {
-    bot: Box<dyn Agent>,
+    bot: Agent<fn(ThinkHandle)>,
     bot_task: Option<ThinkHandle>,
     bot_message: String,
     cursor: Option<(usize, usize)>,
@@ -137,7 +138,7 @@ impl MainState {
         ));
 
         Ok(MainState {
-            bot: Box::new(MctsAgent::new()),
+            bot: Agent::new(mcts_thinking_task),
             bot_task: None,
             bot_message: "Idle".into(),
             cursor: None,
@@ -172,7 +173,7 @@ const COLOR_GRID: Color = C_DARK_GREY;
 const COLOR_SENTE: Color = C_BLUE;
 const COLOR_GOTE: Color = C_RED;
 
-impl EventHandler<GameError> for MainState {
+impl EventHandler<Context, GameError> for MainState {
     fn update(&mut self, _ctx: &mut Context) -> GameResult {
         if let Some(ref task) = self.bot_task {
             if let Some(result) = task.result() {

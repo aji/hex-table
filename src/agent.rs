@@ -24,30 +24,37 @@ pub enum AgentMessage {
     BoardChanged(Bitboard, usize),
 }
 
-pub trait Agent {
-    fn think(&self, board: Bitboard, turn: usize) -> ThinkHandle;
+pub trait AgentThinker: Clone + Send + 'static {
+    fn think(self, handle: ThinkHandle);
 }
 
-pub struct MctsAgent;
-
-impl MctsAgent {
-    pub fn new() -> MctsAgent {
-        MctsAgent
+impl AgentThinker for fn(ThinkHandle) {
+    fn think(self, handle: ThinkHandle) {
+        (self)(handle)
     }
 }
 
-impl Agent for MctsAgent {
-    fn think(&self, board: Bitboard, turn: usize) -> ThinkHandle {
+pub struct Agent<T> {
+    thinker: T,
+}
+
+impl<T: AgentThinker> Agent<T> {
+    pub fn new(thinker: T) -> Self {
+        Self { thinker }
+    }
+
+    pub fn think(&self, board: Bitboard, turn: usize) -> ThinkHandle {
         let handle = ThinkHandle::new(board, turn);
         std::thread::spawn({
+            let thinker = self.thinker.clone();
             let handle = handle.clone();
-            move || mcts_thinking_task(handle)
+            move || thinker.think(handle)
         });
         handle
     }
 }
 
-fn mcts_thinking_task(task: ThinkHandle) {
+pub fn mcts_thinking_task(task: ThinkHandle) {
     let (board, turn) = {
         let data = task.data();
         (data.board, data.turn)
