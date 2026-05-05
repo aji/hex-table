@@ -60,7 +60,7 @@ pub fn mcts_thinking_task(task: ThinkHandle) {
         (data.board, data.turn)
     };
 
-    let best = mcts2::search(board, turn, {
+    let out = mcts2::search(board, turn, {
         let start = Instant::now();
         let task = task.clone();
 
@@ -95,7 +95,7 @@ pub fn mcts_thinking_task(task: ThinkHandle) {
 
     let _ = {
         let mut data = task.data();
-        data.result = Some(best);
+        data.result = Some(out.best);
     };
 }
 

@@ -271,6 +271,10 @@ impl Bitboard {
         }
     }
 
+    pub fn depth(&self) -> usize {
+        ((self.black & !NEXT_MOVE).count_ones() + (self.white & !NEXT_MOVE).count_ones()) as usize
+    }
+
     pub fn transpose(&self) -> Bitboard {
         let mut board = Bitboard {
             black: (self.black & NEXT_MOVE) ^ NEXT_MOVE,
@@ -373,6 +377,10 @@ impl mcts2::MctsState for Bitboard {
         Self::new()
     }
 
+    fn max_move_count() -> usize {
+        121
+    }
+
     fn terminal(&self) -> Option<bool> {
         self.win()
     }
@@ -381,11 +389,10 @@ impl mcts2::MctsState for Bitboard {
         self.mcts_rollout()
     }
 
-    fn children(&self) -> impl ExactSizeIterator<Item = Self> {
-        let BitboardSet(empty) = self.empty();
+    fn children(&self) -> impl ExactSizeIterator<Item = (usize, Self)> {
         (0..121)
-            .filter(move |i| empty & (1 << i) != 0)
-            .map(|i| self.nth_child(i))
+            .filter(|i| self.nth_child_valid(*i))
+            .map(|i| (i, self.nth_child(i)))
             .collect::<Vec<_>>()
             .into_iter()
     }

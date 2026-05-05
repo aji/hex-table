@@ -1,4 +1,4 @@
-use std::{ops::ControlFlow, time::Instant};
+use std::ops::ControlFlow;
 
 use bumpalo::Bump;
 
@@ -7,6 +7,8 @@ use crate::util::Finite;
 pub trait MctsState: Copy + Sized {
     fn init() -> Self;
 
+    fn max_move_count() -> usize;
+
     /// Return Some(true) for sente win, Some(false) for gote win, and None for
     /// intermediate game states.
     fn terminal(&self) -> Option<bool>;
@@ -14,10 +16,11 @@ pub trait MctsState: Copy + Sized {
     /// Return true for sente win and false for gote win.
     fn rollout(&self) -> bool;
 
-    fn children(&self) -> impl ExactSizeIterator<Item = Self>;
+    fn children(&self) -> impl ExactSizeIterator<Item = (usize, Self)>;
 }
 
 struct MctsNode<'a, S> {
+    action: usize,
     state: S,
     children: Option<&'a mut [MctsNode<'a, S>]>,
     num_wins: u32,
@@ -45,12 +48,13 @@ impl std::ops::Add for MctsBackprop {
 }
 
 impl<'a, S: MctsState> MctsNode<'a, S> {
-    fn new(state: S) -> MctsNode<'a, S> {
+    fn new(action: usize, state: S) -> MctsNode<'a, S> {
         let terminal = state.terminal();
         let rollout = state.rollout();
         let num_wins = rollout as u32;
         let num_sims = 1;
         MctsNode {
+            action,
             state,
             terminal,
             num_wins,
@@ -87,7 +91,7 @@ impl<'a, S: MctsState> MctsNode<'a, S> {
                 .expect("no child");
             child.iter(bump, depth + 1)
         } else {
-            let it = self.state.children().map(|s| MctsNode::new(s));
+            let it = self.state.children().map(|(i, s)| MctsNode::new(i, s));
             let children = bump.alloc_slice_fill_iter(it);
             let backprop = children
                 .iter()
@@ -140,6 +144,19 @@ impl<'a, S: MctsState> MctsNode<'a, S> {
             self.state
         }
     }
+
+    fn policy(&self) -> Vec<f32> {
+        let mut policy = vec![0.0; S::max_move_count()];
+        for x in self.children.as_ref().unwrap().iter() {
+            policy[x.action] = x.num_sims as f32 / self.num_sims as f32;
+        }
+        policy
+    }
+
+    fn value(&self) -> f32 {
+        let x = self.num_wins as f32 / self.num_sims as f32;
+        x * 2.0 - 1.0
+    }
 }
 
 pub struct MctsStats<S> {
@@ -165,10 +182,19 @@ where
     }
 }
 
-pub fn search<S: MctsState, M: MctsMonitor<S>>(state: S, depth: usize, mut monitor: M) -> S {
+pub struct Output<S> {
+    pub best: S,
+    pub policy: Vec<f32>,
+    pub value: f32,
+}
+
+pub fn search<S: MctsState, M: MctsMonitor<S>>(
+    state: S,
+    depth: usize,
+    mut monitor: M,
+) -> Output<S> {
     let bump = Bump::new();
-    let mut root = MctsNode::new(state);
-    let mut last_defer: Instant = Instant::now();
+    let mut root = MctsNode::new(0, state);
     let mut min_depth: usize = std::usize::MAX;
     let mut max_depth: usize = 0;
 
@@ -180,25 +206,26 @@ pub fn search<S: MctsState, M: MctsMonitor<S>>(state: S, depth: usize, mut monit
             max_depth = max_depth.max(stat_depth);
         }
 
-        if last_defer.elapsed().as_millis() > 100 {
-            let stats = MctsStats {
-                num_wins: root.num_wins,
-                num_sims: root.num_sims,
-                min_depth,
-                max_depth,
-                allocated_bytes: bump.allocated_bytes(),
-                best_state: root.best(),
-                best_state_leaf: root.best_leaf(),
-            };
-            match monitor.defer(&stats) {
-                ControlFlow::Continue(_) => {}
-                ControlFlow::Break(_) => break,
-            }
-            last_defer = Instant::now();
-            min_depth = std::usize::MAX;
-            max_depth = 0;
+        let stats = MctsStats {
+            num_wins: root.num_wins,
+            num_sims: root.num_sims,
+            min_depth,
+            max_depth,
+            allocated_bytes: bump.allocated_bytes(),
+            best_state: root.best(),
+            best_state_leaf: root.best_leaf(),
+        };
+        match monitor.defer(&stats) {
+            ControlFlow::Continue(_) => {}
+            ControlFlow::Break(_) => break,
         }
+        min_depth = std::usize::MAX;
+        max_depth = 0;
     }
 
-    root.best()
+    Output {
+        best: root.best(),
+        policy: root.policy(),
+        value: root.value(),
+    }
 }

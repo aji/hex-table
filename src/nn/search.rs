@@ -12,7 +12,15 @@ use crate::{
     util::{Finite, IteratorExt},
 };
 
-pub struct Stats {}
+pub struct Output {
+    pub board_sample: Bitboard,
+    pub board_best: Bitboard,
+    pub policy: Vec<f32>,
+}
+
+pub struct Stats {
+    pub iters: usize,
+}
 
 pub trait Monitor {
     fn defer(&self, stats: Stats) -> ControlFlow<()>;
@@ -57,14 +65,14 @@ impl Node {
             }
             Node::Terminal(value) => Backprop { value: *value },
             Node::Edges(edges) => {
-                let puct_numer = edges.iter().map(|e| e.visits as f32).sum::<f32>().sqrt();
+                let puct_total = edges.iter().map(|e| e.visits as f32).sum::<f32>();
                 let puct_select = edges
                     .iter()
-                    .map(|e| e.puct(puct_numer))
+                    .map(|e| e.puct(puct_total))
                     .argmax()
                     .expect("no edges");
                 let e = &mut edges[puct_select];
-                e.step(eval, board.nth_child(e.action))
+                e.step(eval, board)
             }
         }
     }
@@ -91,15 +99,23 @@ impl Edge {
         }
     }
 
-    fn puct(&self, numer: f32) -> Finite {
-        ((PUCT * self.prior * numer / (1.0 + self.visits as f32)) as f64).into()
+    fn puct(&self, n: f32) -> Finite {
+        let c = ((n + 19653.0) / 19652.0).ln() + 2.5;
+        let puct = self.mean_value
+            + (c * self.prior * n.sqrt() / (1.0 + self.visits as f32 + rand::random::<f32>()));
+        (puct as f64).into()
     }
 
     fn step<E: Evaluator>(&mut self, eval: &E, board: Bitboard) -> Backprop {
-        let backprop = self.child.step(eval, board);
+        let backprop = self.child.step(eval, board.nth_child(self.action));
+
+        let my_value = match board.sente() {
+            true => backprop.value,
+            false => -backprop.value,
+        };
 
         self.visits += 1;
-        self.total_value += backprop.value;
+        self.total_value += my_value;
         self.mean_value = self.total_value / self.visits as f32;
 
         backprop
@@ -123,20 +139,21 @@ impl Tree {
         self.root.step(eval, self.root_board);
     }
 
-    fn play(&self, temp: f32) -> Bitboard {
+    fn policy(&self) -> Vec<f32> {
+        let mut policy: Vec<f32> = vec![0.0; BOARD_SIZE];
         let Node::Edges(ref edges) = self.root else {
             panic!("root has no children");
         };
-        let n = edges.len();
-        assert!(n > 0, "root has no valid moves");
-        let xs = edges
-            .iter()
-            .map(|e| (e.visits as f32).powf(1.0 / temp))
-            .cumsum()
-            .collect::<Vec<_>>();
-        let x = rand::random_range(0.0..xs[n - 1]);
-        let i = xs.iter().position(|y| *y > x).expect("sampling failed");
-        self.root_board.nth_child(edges[i].action)
+        let mut total = 0.0;
+        for edge in edges.iter() {
+            let x = edge.visits as f32;
+            policy[edge.action] = x;
+            total += x;
+        }
+        for x in policy.iter_mut() {
+            *x /= total;
+        }
+        policy
     }
 }
 
@@ -144,17 +161,84 @@ pub fn search<B: Backend, M: Monitor>(
     model: &Model<B>,
     device: &B::Device,
     board: Bitboard,
-    _mon: M,
-) -> Bitboard {
+    mon: M,
+) -> Output {
     let eval = ModelEvaluator { model, device };
-    let mut tree = Tree::new(board);
-    for _ in 0..600 {
-        tree.step(&eval);
-    }
-    tree.play(1.0)
+    search_with_evaluator(&eval, board, mon)
 }
 
-trait Evaluator {
+pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
+    eval: &E,
+    board: Bitboard,
+    mon: M,
+) -> Output {
+    let mut tree = Tree::new(board);
+    for iters in 0.. {
+        tree.step(eval);
+        let stats = Stats { iters };
+        if let ControlFlow::Break(_) = mon.defer(stats) {
+            break;
+        }
+    }
+
+    let policy = tree.policy();
+    let sample = policy
+        .iter()
+        .copied()
+        .sample_weighted(&mut rand::rng())
+        .expect("root has no children");
+    let best = policy
+        .iter()
+        .map(|x| Finite::from(*x as f64))
+        .argmax()
+        .expect("root has no children");
+    // println!(
+    //     "sample={},{} best={},{}",
+    //     sample / BOARD_COLS,
+    //     sample % BOARD_COLS,
+    //     best / BOARD_COLS,
+    //     best % BOARD_COLS
+    // );
+    // for r in 0..BOARD_ROWS {
+    //     for _ in 0..r {
+    //         print!("    ");
+    //     }
+    //     for c in 0..BOARD_COLS {
+    //         let i = r * BOARD_COLS + c;
+    //         let x = policy[i];
+    //         let color = if x < 1e-5 { "34" } else { "0" };
+    //         print!("\x1b[{}m{:7.5} ", color, x);
+    //     }
+    //     println!("\x1b[0m");
+    // }
+    // let f = match board.sente() {
+    //     true => 1.0,
+    //     false => -1.0,
+    // };
+    // for r in 0..BOARD_ROWS {
+    //     for _ in 0..r {
+    //         print!("    ");
+    //     }
+    //     for c in 0..BOARD_COLS {
+    //         let Node::Edges(ref edges) = tree.root else {
+    //             panic!();
+    //         };
+    //         let i = r * BOARD_COLS + c;
+    //         match edges.iter().find(|e| e.action == i) {
+    //             Some(e) => print!("{:7.4} ", f * e.mean_value),
+    //             None => print!("      - "),
+    //         }
+    //     }
+    //     println!();
+    // }
+    Output {
+        board_sample: board.nth_child(sample),
+        board_best: board.nth_child(best),
+        policy,
+    }
+}
+
+pub trait Evaluator {
     fn call(&self, board: Bitboard) -> (Vec<f32>, f32);
 }
 

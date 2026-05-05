@@ -25,12 +25,13 @@ fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
             true => black_rollouts,
             false => white_rollouts,
         };
-        board = mcts2::search(board, turn, |stats: &MctsStats<Bitboard>| {
+        let out = mcts2::search(board, turn, |stats: &MctsStats<Bitboard>| {
             match stats.num_sims > max_sims {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
             }
         });
+        board = out.best;
     }
     unreachable!()
 }
@@ -39,7 +40,7 @@ fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
 fn one_turn(game: Bitboard, depth: usize) -> Bitboard {
     let start_search = Instant::now();
     let init_state = game;
-    mcts2::search(init_state, depth, |stats: &MctsStats<Bitboard>| {
+    let out = mcts2::search(init_state, depth, |stats: &MctsStats<Bitboard>| {
         let elapsed = start_search.elapsed();
         print!("\x1b[H\x1b[J");
         println!("{}", BitboardPretty(&init_state));
@@ -66,7 +67,8 @@ fn one_turn(game: Bitboard, depth: usize) -> Bitboard {
             true => ControlFlow::Break(()),
             false => ControlFlow::Continue(()),
         }
-    })
+    });
+    out.best
 }
 
 const CSV: &'static str = "notebooks/mcts2.txt";

@@ -1,5 +1,7 @@
 use std::fmt;
 
+use rand::RngExt;
+
 const KILO: usize = 1000;
 const MEGA: usize = 1000 * KILO;
 const GIGA: usize = 1000 * MEGA;
@@ -76,11 +78,30 @@ pub trait IteratorExt: Iterator {
     fn cumsum(self) -> CumSum<Self>
     where
         Self: Sized,
-        Self::Item: std::ops::Add<Output = Self::Item> + Clone,
+        Self::Item: Clone + std::ops::Add<Output = Self::Item>,
     {
         CumSum {
             inner: self,
             total: None,
+        }
+    }
+
+    fn sample_weighted(self, rng: &mut impl rand::Rng) -> Option<usize>
+    where
+        Self: Sized,
+        Self::Item: Clone
+            + std::ops::Add<Output = Self::Item>
+            + std::ops::Mul<Output = Self::Item>
+            + std::cmp::PartialOrd,
+        rand::distr::StandardUniform: rand::distr::Distribution<Self::Item>,
+    {
+        let sum = self.cumsum().collect::<Vec<_>>();
+        let n = sum.len();
+        if n == 0 {
+            None
+        } else {
+            let thresh = rng.random::<Self::Item>() * sum[n - 1].clone();
+            Some(sum.iter().position(|p| *p > thresh).expect("sample failed"))
         }
     }
 }

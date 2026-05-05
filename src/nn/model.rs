@@ -52,7 +52,7 @@ use burn::{
     },
     tensor::{
         Shape,
-        activation::{relu, tanh},
+        activation::{leaky_relu, softmax, tanh},
         backend::Backend,
         module::conv2d,
         ops::ConvOptions,
@@ -156,7 +156,7 @@ impl<B: Backend> ConvInputBlock<B> {
     fn forward(&self, board: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv.forward(board);
         let x = self.norm.forward(x);
-        relu(x)
+        leaky_relu(x, LEAK)
     }
 }
 
@@ -199,11 +199,11 @@ impl<B: Backend> ConvResidualBlock<B> {
     fn forward(&self, planes: Tensor<B, 4>) -> Tensor<B, 4> {
         let x = self.conv0.forward(planes.clone());
         let x = self.norm0.forward(x);
-        let x = relu(x);
+        let x = leaky_relu(x, LEAK);
         let x = self.conv1.forward(x);
         let x = self.norm1.forward(x);
         let x = x + planes;
-        relu(x)
+        leaky_relu(x, LEAK)
     }
 }
 
@@ -245,9 +245,10 @@ impl<B: Backend> PolicyHead<B> {
     fn forward(&self, planes: Tensor<B, 4>) -> Tensor<B, 2> {
         let x = self.conv.forward(planes);
         let x = self.norm.forward(x);
-        let x = relu(x);
+        let x = leaky_relu(x, LEAK);
         let x = x.flatten(1, -1);
-        self.linear.forward(x)
+        let x = self.linear.forward(x);
+        softmax(x, 1)
     }
 }
 
@@ -292,10 +293,10 @@ impl<B: Backend> ValueHead<B> {
     fn forward(&self, planes: Tensor<B, 4>) -> Tensor<B, 1> {
         let x = self.conv.forward(planes);
         let x = self.norm.forward(x);
-        let x = relu(x);
+        let x = leaky_relu(x, LEAK);
         let x = x.reshape([-1, BOARD_SIZE as isize]);
         let x = self.linear0.forward(x);
-        let x = relu(x);
+        let x = leaky_relu(x, LEAK);
         let x = self.linear1.forward(x);
         let x = x.reshape([-1]);
         tanh(x)
@@ -343,6 +344,21 @@ impl<B: Backend> Model<B> {
 
         (policy, value)
     }
+
+    pub fn forward_loss(&self, item: TrainInput<B>) -> Tensor<B, 1> {
+        let (policies, values) = self.forward(item.boards);
+        let n = values.shape().num_elements() as f32;
+
+        let mse_loss = item.values.sub(values).powi_scalar(2).sum().div_scalar(n);
+        let cross_entropy_loss = item
+            .policies
+            .reshape([-1])
+            .dot(policies.reshape([-1]).log())
+            .neg()
+            .div_scalar(n);
+
+        mse_loss + cross_entropy_loss
+    }
 }
 
 impl ModelConfig {
@@ -358,23 +374,58 @@ impl ModelConfig {
     }
 }
 
+fn board_to_contiguous(board: Bitboard) -> impl Iterator<Item = f32> {
+    (0..2).flat_map(move |plane| {
+        (0..BOARD_SIZE).map(move |i| match board.idx(i) {
+            Some(true) => (plane == 0) as usize as f32,
+            Some(false) => (plane == 1) as usize as f32,
+            None => 0.0,
+        })
+    })
+}
+
 pub fn boards_to_tensor<B: Backend>(
     boards: impl Iterator<Item = Bitboard>,
     device: &B::Device,
 ) -> Tensor<B, 4> {
-    let contiguous: Vec<f32> = boards
-        .flat_map(|board| {
-            (0..2).flat_map(move |plane| {
-                (0..BOARD_SIZE).map(move |i| match board.idx(i) {
-                    Some(true) => (plane == 0) as usize as f32,
-                    Some(false) => (plane == 1) as usize as f32,
-                    None => 0.0,
-                })
-            })
-        })
-        .collect();
+    let contiguous: Vec<f32> = boards.flat_map(board_to_contiguous).collect();
     let num_boards = contiguous.len() / (2 * BOARD_SIZE);
 
     Tensor::<B, 1>::from_floats(&contiguous[..], device)
         .reshape([num_boards, 2, BOARD_ROWS, BOARD_COLS])
+}
+
+pub struct TrainInput<B: Backend> {
+    boards: Tensor<B, 4>,
+    policies: Tensor<B, 2>,
+    values: Tensor<B, 1>,
+}
+
+pub fn examples_to_input<B: Backend>(
+    examples: impl Iterator<Item = (Bitboard, Vec<f32>, f32)>,
+    device: &B::Device,
+) -> TrainInput<B> {
+    let mut boards: Vec<f32> = Vec::new();
+    let mut policies: Vec<f32> = Vec::new();
+    let mut values: Vec<f32> = Vec::new();
+
+    for (board, policy, value) in examples {
+        boards.extend(board_to_contiguous(board));
+        policies.extend(policy);
+        values.push(value);
+    }
+
+    let num_boards = values.len();
+
+    let boards = Tensor::<B, 1>::from_floats(&boards[..], device)
+        .reshape([num_boards, 2, BOARD_ROWS, BOARD_COLS]);
+    let policies =
+        Tensor::<B, 1>::from_floats(&policies[..], device).reshape([num_boards, BOARD_SIZE]);
+    let values = Tensor::<B, 1>::from_floats(&values[..], device);
+
+    TrainInput {
+        boards,
+        policies,
+        values,
+    }
 }
