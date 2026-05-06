@@ -4,7 +4,7 @@ use std::{
     ops::ControlFlow,
     sync::{
         Arc, RwLock,
-        mpsc::{Receiver, Sender, SyncSender, channel, sync_channel},
+        mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel},
     },
     time::{Duration, Instant},
 };
@@ -15,15 +15,15 @@ use burn::{
         GradientsParams, Optimizer, SgdConfig, decay::WeightDecayConfig, momentum::MomentumConfig,
     },
     record::Record,
-    tensor::{Transaction, backend::Backend},
+    tensor::backend::Backend,
 };
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
     mcts2,
     nn::{
-        constants::*,
         model::{
-            Model, ModelConfig, ModelRecord, ModelRecordItem, boards_to_tensor, examples_to_input,
+            EvalRequest, EvalResult, Model, ModelConfig, ModelRecord, ModelRecordItem,
+            examples_to_input,
         },
         search::{Evaluator, search_with_evaluator},
         transform::{Transform, Transforms, Transpose},
@@ -37,17 +37,19 @@ type Dev = <Back as Backend>::Device;
 
 const BATCH_EVALS: usize = 32;
 const SELF_PLAY_CONCURRENCY: usize = 128;
+const SELF_PLAY_DIRICHLET: f32 = 0.25;
+const SELF_PLAY_SAMPLE_THRESHOLD: usize = 30;
 
 #[derive(Clone)]
 struct Context {
     config: ModelConfig,
     latest: Arc<RwLock<ModelRecordItem<Back, Prec>>>,
     examples: Arc<RwLock<ExampleBuffer>>,
-    evaluator: Sender<EvalRequest>,
+    evaluator: Sender<EvaluatorMsg>,
 }
 
 impl Context {
-    fn new(cf: ModelConfig, evaluator: Sender<EvalRequest>) -> Self {
+    fn new(cf: ModelConfig, evaluator: Sender<EvaluatorMsg>) -> Self {
         let model = cf.init::<Back>(&Default::default());
         let item = model.into_record().into_item();
         Context {
@@ -130,11 +132,11 @@ impl Context {
 struct BatchEvaluator<'a>(&'a Context);
 
 impl<'a> Evaluator for BatchEvaluator<'a> {
-    fn call(&self, board: Bitboard) -> (Vec<f32>, f32) {
+    fn call(&self, board: Bitboard) -> EvalResult {
         let (send, recv) = sync_channel(1);
         self.0
             .evaluator
-            .send(EvalRequest::Board(board, send))
+            .send(EvaluatorMsg::Queue(board, send))
             .unwrap();
         recv.recv().unwrap()
     }
@@ -172,32 +174,40 @@ struct Example {
     value: f32,
 }
 
-enum EvalRequest {
-    Board(Bitboard, SyncSender<(Vec<f32>, f32)>),
+type EvaluatorRet = SyncSender<EvalResult>;
+
+enum EvaluatorMsg {
+    Queue(Bitboard, EvaluatorRet),
 }
 
-struct PendingEval {
-    board: Bitboard,
-    tf: Transforms,
-    ret: SyncSender<(Vec<f32>, f32)>,
-}
-
-fn evaluator(ctx: Context, inbox: Receiver<EvalRequest>) {
+fn evaluator(ctx: Context, inbox: Receiver<EvaluatorMsg>) {
     let device = Default::default();
     let mut model = ctx.init(&device);
     let mut last_update = Instant::now();
 
-    let mut pending: Vec<PendingEval> = Vec::new();
+    let mut pending: Vec<(EvalRequest, EvaluatorRet)> = Vec::new();
 
     loop {
-        let EvalRequest::Board(board, ret) = inbox.recv().unwrap();
-        let mut tf = Transforms::new();
-        if !board.sente() {
-            tf.push(Transpose::new());
-        }
-        pending.push(PendingEval { board, tf, ret });
+        let go = match inbox.recv_timeout(Duration::from_millis(100)) {
+            Ok(EvaluatorMsg::Queue(board, ret)) => {
+                let mut tf = Transforms::new();
+                if !board.sente() {
+                    tf.push(Transpose::new());
+                }
+                pending.push((
+                    EvalRequest {
+                        board,
+                        transform: tf,
+                    },
+                    ret,
+                ));
+                pending.len() >= BATCH_EVALS
+            }
+            Err(RecvTimeoutError::Timeout) => true,
+            _ => panic!(),
+        };
 
-        if pending.len() < BATCH_EVALS {
+        if !go {
             continue;
         }
 
@@ -207,28 +217,12 @@ fn evaluator(ctx: Context, inbox: Receiver<EvalRequest>) {
         }
 
         let model = model.valid();
-        let batch = std::mem::take(&mut pending);
-        let boards: Vec<Bitboard> = batch.iter().map(|x| x.tf.apply_board(x.board)).collect();
-        let boards_ten = boards_to_tensor(boards.iter().copied(), &device);
-
-        let (policy, value) = model.forward(boards_ten);
-        let [policy, value] = Transaction::default()
-            .register(policy)
-            .register(value)
-            .execute()
-            .try_into()
-            .expect("wrong tensor count");
-        let policy = policy.into_vec().unwrap();
-        let value = value.into_vec().unwrap();
-
-        for (i, x) in batch.iter().enumerate() {
-            let i0 = i * BOARD_SIZE;
-            let i1 = (i + 1) * BOARD_SIZE;
-
-            let policy = x.tf.unapply_policy(policy[i0..i1].to_vec());
-            let value = x.tf.unapply_value(value[i]);
-
-            x.ret.send((policy, value)).unwrap();
+        let (reqs, rets): (Vec<_>, Vec<_>) = std::mem::take(&mut pending).into_iter().unzip();
+        for (ret, res) in rets
+            .into_iter()
+            .zip(model.eval_batch(reqs, &device).into_iter())
+        {
+            ret.send(res).unwrap();
         }
     }
 }
@@ -258,20 +252,27 @@ fn prefill(ctx: Context) {
 fn self_play(idx: usize, ctx: Context) {
     loop {
         ctx.play(|board| {
-            if board.depth() % 10 == 0 {
+            let depth = board.depth();
+            if depth % 10 == 0 {
                 println!(
                     "n={} self play {idx:03} move {:3}",
                     ctx.num_examples(),
                     board.depth()
                 );
             }
-            let limit = 200 + 5 * idx;
+            let limit = 600 + idx;
             let eval = BatchEvaluator(&ctx);
-            let out = search_with_evaluator(&eval, board, |n: usize| n < limit);
+            let out =
+                search_with_evaluator(&eval, board, SELF_PLAY_DIRICHLET, |n: usize| n < limit);
+            let (board, value) = if depth < SELF_PLAY_SAMPLE_THRESHOLD {
+                (out.board_sample, out.value_sample)
+            } else {
+                (out.board_best, out.value_best)
+            };
             if idx == SELF_PLAY_CONCURRENCY - 1 {
-                println!("{}", BitboardPretty(&out.board_sample));
+                println!("value={}\n{}", value, BitboardPretty(&board));
             }
-            (out.board_sample, out.policy)
+            (board, out.policy)
         });
     }
 }

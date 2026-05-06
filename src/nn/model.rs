@@ -51,15 +51,21 @@ use burn::{
         conv::{Conv2d, Conv2dConfig},
     },
     tensor::{
-        Shape,
-        activation::{leaky_relu, softmax, tanh},
+        Shape, Transaction,
+        activation::{leaky_relu, log_softmax, tanh},
         backend::Backend,
         module::conv2d,
         ops::ConvOptions,
     },
 };
 
-use crate::{bb::Bitboard, nn::constants::*};
+use crate::{
+    bb::Bitboard,
+    nn::{
+        constants::*,
+        transform::{Transform, Transforms, Transpose},
+    },
+};
 
 /// A convolution of a 2D hexagonal grid
 ///
@@ -248,7 +254,7 @@ impl<B: Backend> PolicyHead<B> {
         let x = leaky_relu(x, LEAK);
         let x = x.flatten(1, -1);
         let x = self.linear.forward(x);
-        softmax(x, 1)
+        log_softmax(x, 1)
     }
 }
 
@@ -332,6 +338,25 @@ pub struct ModelConfig {
     pub value_hidden: usize,
 }
 
+pub struct EvalRequest {
+    pub board: Bitboard,
+    pub transform: Transforms,
+}
+
+impl EvalRequest {
+    pub fn new(board: Bitboard) -> Self {
+        Self {
+            board,
+            transform: Transforms::new(),
+        }
+    }
+}
+
+pub struct EvalResult {
+    pub policy: Vec<f32>,
+    pub value: f32,
+}
+
 impl<B: Backend> Model<B> {
     pub fn forward(&self, board: Tensor<B, 4>) -> (Tensor<B, 2>, Tensor<B, 1>) {
         let x = self
@@ -353,11 +378,54 @@ impl<B: Backend> Model<B> {
         let cross_entropy_loss = item
             .policies
             .reshape([-1])
-            .dot(policies.reshape([-1]).log())
+            .dot(policies.reshape([-1]))
             .neg()
             .div_scalar(n);
 
         mse_loss + cross_entropy_loss
+    }
+
+    pub fn eval_batch(&self, mut reqs: Vec<EvalRequest>, device: &B::Device) -> Vec<EvalResult> {
+        for req in reqs.iter_mut() {
+            if !req.board.sente() {
+                req.transform.push(Transpose::new());
+            }
+        }
+
+        let boards: Vec<Bitboard> = reqs
+            .iter()
+            .map(|x| x.transform.apply_board(x.board))
+            .collect();
+        let boards_ten = boards_to_tensor(boards.iter().copied(), device);
+
+        let (policy, value) = self.forward(boards_ten);
+        let [policy, value] = Transaction::default()
+            .register(policy.exp())
+            .register(value)
+            .execute()
+            .try_into()
+            .expect("wrong tensor count");
+        let policy = policy.into_vec().unwrap();
+        let value = value.into_vec().unwrap();
+
+        let mut res = Vec::new();
+        for (i, x) in reqs.iter().enumerate() {
+            let i0 = i * BOARD_SIZE;
+            let i1 = (i + 1) * BOARD_SIZE;
+
+            let policy = x.transform.unapply_policy(policy[i0..i1].to_vec());
+            let value = x.transform.unapply_value(value[i]);
+
+            res.push(EvalResult { policy, value });
+        }
+        res
+    }
+
+    pub fn eval_one(&self, req: EvalRequest, device: &B::Device) -> EvalResult {
+        self.eval_batch(vec![req], device)
+            .into_iter()
+            .next()
+            .unwrap()
     }
 }
 

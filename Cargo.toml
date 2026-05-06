@@ -8,4 +8,5 @@ bumpalo = { version = "3.20.2" }
 burn = { version = "0.20.1", features = ["wgpu", "cpu", "fusion", "train", "std", "tui"] }
 ggez = "0.10.0-rc0"
 rand = "0.10.1"
+rand_distr = "0.6.0"
 rayon = "1.12.0"

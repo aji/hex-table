@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
     mcts2,
-    nn::{self, search::Evaluator},
+    nn::{self, model::EvalResult, search::Evaluator},
 };
 
 pub fn main() {
@@ -14,9 +14,10 @@ pub fn main() {
             if board.win().is_some() {
                 break;
             }
-            let out =
-                nn::search::search_with_evaluator(&MctsEval, board, |iters: usize| iters < 1200);
-            board = out.board_sample;
+            let out = nn::search::search_with_evaluator(&MctsEval, board, 0.0, |iters: usize| {
+                iters < 1200
+            });
+            board = out.board_best;
         }
         println!("GAME OVER\n\n\n");
     }
@@ -25,7 +26,7 @@ pub fn main() {
 struct MctsEval;
 
 impl Evaluator for MctsEval {
-    fn call(&self, board: Bitboard) -> (Vec<f32>, f32) {
+    fn call(&self, board: Bitboard) -> EvalResult {
         let out = mcts2::search(
             board,
             board.depth(),
@@ -34,6 +35,9 @@ impl Evaluator for MctsEval {
                 false => ControlFlow::Continue(()),
             },
         );
-        (out.policy, out.value)
+        EvalResult {
+            policy: out.policy,
+            value: out.value,
+        }
     }
 }

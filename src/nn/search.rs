@@ -1,13 +1,13 @@
 use std::ops::ControlFlow;
 
-use burn::tensor::{Transaction, backend::Backend};
+use burn::tensor::backend::Backend;
+use rand_distr::{Distribution, multi::Dirichlet};
 
 use crate::{
     bb::Bitboard,
     nn::{
         constants::*,
-        model::{Model, boards_to_tensor},
-        transform::{self, Transform},
+        model::{EvalRequest, EvalResult, Model},
     },
     util::{Finite, IteratorExt},
 };
@@ -16,6 +16,8 @@ pub struct Output {
     pub board_sample: Bitboard,
     pub board_best: Bitboard,
     pub policy: Vec<f32>,
+    pub value_sample: f32,
+    pub value_best: f32,
 }
 
 pub struct Stats {
@@ -49,7 +51,7 @@ enum Node {
 }
 
 impl Node {
-    fn step<E: Evaluator>(&mut self, eval: &E, board: Bitboard) -> Backprop {
+    fn step<E: Evaluator>(&mut self, eval: &E, board: Bitboard, parent_value: f32) -> Backprop {
         match self {
             Node::Leaf => {
                 if let Some(sente) = board.win() {
@@ -57,21 +59,30 @@ impl Node {
                     *self = Node::Terminal(value);
                     Backprop { value }
                 } else {
-                    let (policy, value) = eval.call(board);
+                    let res = eval.call(board);
+                    let policy_denom_valid = res
+                        .policy
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| board.nth_child_valid(*i))
+                        .map(|(_, x)| *x)
+                        .sum::<f32>()
+                        .max(1e-6);
                     let edges = (0..BOARD_SIZE)
                         .filter(|i| board.nth_child_valid(*i))
-                        .map(|i| Edge::new(i, policy[i]))
+                        .map(|i| Edge::new(i, res.policy[i] / policy_denom_valid))
                         .collect::<Vec<_>>();
                     *self = Node::Edges(edges);
-                    Backprop { value }
+                    Backprop { value: res.value }
                 }
             }
             Node::Terminal(value) => Backprop { value: *value },
             Node::Edges(edges) => {
-                let puct_total = edges.iter().map(|e| e.visits as f32).sum::<f32>();
+                let invert_value = !board.sente();
+                let puct_total = edges.iter().map(|e| e.visits).sum::<usize>();
                 let puct_select = edges
                     .iter()
-                    .map(|e| e.puct(puct_total))
+                    .map(|e| e.puct(invert_value, parent_value, puct_total as f32))
                     .argmax()
                     .expect("no edges");
                 let e = &mut edges[puct_select];
@@ -102,23 +113,20 @@ impl Edge {
         }
     }
 
-    fn puct(&self, n: f32) -> Finite {
-        let c = ((n + 19653.0) / 19652.0).ln() + 2.5;
-        let puct = self.mean_value
-            + (c * self.prior * n.sqrt() / (1.0 + self.visits as f32 + rand::random::<f32>()));
+    fn puct(&self, invert_value: bool, parent_value: f32, n: f32) -> Finite {
+        let f = if invert_value { -1.0 } else { 1.0 };
+        let v = if self.visits == 0 { parent_value - f * FPU_PENALTY } else { self.mean_value };
+        let puct = f * v + PUCT * self.prior * (1.0 + n).sqrt() / (1.0 + self.visits as f32);
         (puct as f64).into()
     }
 
     fn step<E: Evaluator>(&mut self, eval: &E, board: Bitboard) -> Backprop {
-        let backprop = self.child.step(eval, board.nth_child(self.action));
-
-        let my_value = match board.sente() {
-            true => backprop.value,
-            false => -backprop.value,
-        };
+        let backprop = self
+            .child
+            .step(eval, board.nth_child(self.action), self.mean_value);
 
         self.visits += 1;
-        self.total_value += my_value;
+        self.total_value += backprop.value;
         self.mean_value = self.total_value / self.visits as f32;
 
         backprop
@@ -126,20 +134,44 @@ impl Edge {
 }
 
 struct Tree {
+    dirichlet: f32,
     root_board: Bitboard,
+    root_visits: usize,
+    root_total_value: f32,
+    root_mean_value: f32,
     root: Node,
 }
 
 impl Tree {
-    fn new(board: Bitboard) -> Tree {
+    fn new(board: Bitboard, dirichlet: f32) -> Tree {
         Tree {
+            dirichlet,
             root_board: board,
+            root_visits: 0,
+            root_total_value: 0.0,
+            root_mean_value: 0.0,
             root: Node::Leaf,
         }
     }
 
     fn step<E: Evaluator>(&mut self, eval: &E) {
-        self.root.step(eval, self.root_board);
+        let backprop = self.root.step(eval, self.root_board, self.root_mean_value);
+
+        if self.root_visits == 0
+            && self.dirichlet > 0.0
+            && let Node::Edges(ref mut edges) = self.root
+            && edges.len() >= 2
+        {
+            let dist = Dirichlet::new(vec![DIRICHLET_ALPHA; edges.len()].as_slice()).unwrap();
+            let noise = dist.sample(&mut rand::rng());
+            for (i, e) in edges.iter_mut().enumerate() {
+                e.prior = (1.0 - self.dirichlet) * e.prior + self.dirichlet * noise[i];
+            }
+        }
+
+        self.root_visits += 1;
+        self.root_total_value += backprop.value;
+        self.root_mean_value = self.root_total_value / self.root_visits as f32;
     }
 
     fn policy(&self) -> Vec<f32> {
@@ -158,27 +190,42 @@ impl Tree {
         }
         policy
     }
+
+    fn value(&self, action: usize) -> f32 {
+        let Node::Edges(ref edges) = self.root else {
+            panic!("root has no children");
+        };
+        edges
+            .iter()
+            .find(|e| e.action == action)
+            .map(|e| e.mean_value)
+            .unwrap_or(0.0)
+    }
 }
 
 pub fn search<B: Backend, M: Monitor>(
     model: &Model<B>,
     device: &B::Device,
     board: Bitboard,
+    dirichlet: f32,
     mon: M,
 ) -> Output {
     let eval = ModelEvaluator { model, device };
-    search_with_evaluator(&eval, board, mon)
+    search_with_evaluator(&eval, board, dirichlet, mon)
 }
 
 pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
     eval: &E,
     board: Bitboard,
+    dirichlet: f32,
     mon: M,
 ) -> Output {
-    let mut tree = Tree::new(board);
-    for iters in 0.. {
+    let mut tree = Tree::new(board, dirichlet);
+    for _ in 0.. {
         tree.step(eval);
-        let stats = Stats { iters };
+        let stats = Stats {
+            iters: tree.root_visits,
+        };
         if let ControlFlow::Break(_) = mon.defer(stats) {
             break;
         }
@@ -199,11 +246,13 @@ pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
         board_sample: board.nth_child(sample),
         board_best: board.nth_child(best),
         policy,
+        value_sample: tree.value(sample),
+        value_best: tree.value(best),
     }
 }
 
 pub trait Evaluator {
-    fn call(&self, board: Bitboard) -> (Vec<f32>, f32);
+    fn call(&self, board: Bitboard) -> EvalResult;
 }
 
 struct ModelEvaluator<'a, B: Backend> {
@@ -212,38 +261,7 @@ struct ModelEvaluator<'a, B: Backend> {
 }
 
 impl<'a, B: Backend> Evaluator for ModelEvaluator<'a, B> {
-    fn call(&self, board: Bitboard) -> (Vec<f32>, f32) {
-        let tf = {
-            let mut tf = transform::Transforms::new();
-            if !board.sente() {
-                tf.push(transform::Transpose::new());
-            }
-            tf
-        };
-
-        // forward transformations
-        let board = tf.apply_board(board);
-
-        // run model
-        let tensor = boards_to_tensor([board].into_iter(), self.device);
-        let (p, v) = self.model.forward(tensor);
-        let p = p.reshape([BOARD_SIZE]);
-        let v = v.reshape([1]);
-        let [p, v] = Transaction::default()
-            .register(p)
-            .register(v)
-            .execute()
-            .try_into()
-            .expect("wrong tensor count");
-        let p = p.into_vec::<f32>().expect("p into_vec() failed");
-        let v = v.into_vec::<f32>().expect("v into_vec() failed");
-        assert_eq!(p.len(), BOARD_SIZE);
-        assert_eq!(v.len(), 1);
-
-        // backward transformations
-        let p = tf.unapply_policy(p);
-        let v = tf.unapply_value(v[0]);
-
-        (p, v)
+    fn call(&self, board: Bitboard) -> EvalResult {
+        self.model.eval_one(EvalRequest::new(board), self.device)
     }
 }
