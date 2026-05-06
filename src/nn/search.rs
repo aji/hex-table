@@ -195,45 +195,6 @@ pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
         .map(|x| Finite::from(*x as f64))
         .argmax()
         .expect("root has no children");
-    // println!(
-    //     "sample={},{} best={},{}",
-    //     sample / BOARD_COLS,
-    //     sample % BOARD_COLS,
-    //     best / BOARD_COLS,
-    //     best % BOARD_COLS
-    // );
-    // for r in 0..BOARD_ROWS {
-    //     for _ in 0..r {
-    //         print!("    ");
-    //     }
-    //     for c in 0..BOARD_COLS {
-    //         let i = r * BOARD_COLS + c;
-    //         let x = policy[i];
-    //         let color = if x < 1e-5 { "34" } else { "0" };
-    //         print!("\x1b[{}m{:7.5} ", color, x);
-    //     }
-    //     println!("\x1b[0m");
-    // }
-    // let f = match board.sente() {
-    //     true => 1.0,
-    //     false => -1.0,
-    // };
-    // for r in 0..BOARD_ROWS {
-    //     for _ in 0..r {
-    //         print!("    ");
-    //     }
-    //     for c in 0..BOARD_COLS {
-    //         let Node::Edges(ref edges) = tree.root else {
-    //             panic!();
-    //         };
-    //         let i = r * BOARD_COLS + c;
-    //         match edges.iter().find(|e| e.action == i) {
-    //             Some(e) => print!("{:7.4} ", f * e.mean_value),
-    //             None => print!("      - "),
-    //         }
-    //     }
-    //     println!();
-    // }
     Output {
         board_sample: board.nth_child(sample),
         board_best: board.nth_child(best),
