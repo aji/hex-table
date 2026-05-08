@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{StatusCode, blocking::Client, header};
+use bytes::BytesMut;
 
 use crate::{
     bb::Bitboard,
@@ -15,6 +15,8 @@ use crate::{
         model::{EvalRequest, EvalResult, Model, ModelConfig},
         search::{Evaluator, search_with_evaluator},
         train::{
+            controller::{ControllerClient, FetchModelData},
+            error::TrainError,
             metrics::CounterLog,
             positions::{Position, SERIALIZED_LEN},
         },
@@ -26,10 +28,9 @@ type Wgpu = burn::backend::Wgpu<f32, i32>;
 
 #[derive(Clone)]
 struct AppConfig {
-    client: Client,
+    client: ControllerClient,
     to_evaluator: Sender<EvaluatorMsg>,
     to_uploader: Sender<UploaderMsg>,
-    controller_url: String,
     model_id: String,
     batch_evals: usize,
     concurrency: usize,
@@ -40,19 +41,16 @@ struct AppConfig {
     total_games_sente: Arc<AtomicUsize>,
 }
 
-enum FetchModelData {
-    NotModified,
-    Data(Option<String>, Vec<u8>),
-}
-
 impl AppConfig {
     fn load(eval: Sender<EvaluatorMsg>, pos: Sender<UploaderMsg>) -> Self {
+        let controller_url = std::env::var("HEX_TRAIN_CONTROLLER_URL")
+            .expect("HEX_TRAIN_CONTROLLER_URL is a required env var");
+        log::info!("HEX_TRAIN_CONTROLLER_URL={}", controller_url);
+
         let cf = Self {
-            client: Client::new(),
+            client: ControllerClient::new(controller_url),
             to_evaluator: eval,
             to_uploader: pos,
-            controller_url: std::env::var("HEX_TRAIN_CONTROLLER_URL")
-                .expect("HEX_TRAIN_CONTROLLER_URL is a required env var"),
             model_id: std::env::var("HEX_TRAIN_MODEL_ID")
                 .expect("HEX_TRAIN_MODEL_ID is a required env var"),
             batch_evals: std::env::var("HEX_TRAIN_SELF_PLAY_BATCH_EVALS")
@@ -73,15 +71,6 @@ impl AppConfig {
             total_games_sente: Arc::new(AtomicUsize::new(0)),
         };
 
-        log::info!("HEX_TRAIN_CONTROLLER_URL={}", cf.controller_url);
-        log::info!("HEX_TRAIN_MODEL_ID={}", cf.model_id);
-        log::info!("HEX_TRAIN_SELF_PLAY_BATCH_EVALS={}", cf.batch_evals);
-        log::info!("HEX_TRAIN_SELF_PLAY_CONCURRENCY={}", cf.concurrency);
-        log::info!("HEX_TRAIN_SELF_PLAY_ITERS={}", cf.iters);
-
-        if cf.controller_url.ends_with("/") {
-            panic!("controller_url={:?} cannot end in '/'", cf.controller_url);
-        }
         if cf.concurrency <= cf.batch_evals {
             panic!(
                 "concurrency={} must be greater than batch_evals={}",
@@ -89,42 +78,12 @@ impl AppConfig {
             );
         }
 
+        log::info!("HEX_TRAIN_MODEL_ID={}", cf.model_id);
+        log::info!("HEX_TRAIN_SELF_PLAY_BATCH_EVALS={}", cf.batch_evals);
+        log::info!("HEX_TRAIN_SELF_PLAY_CONCURRENCY={}", cf.concurrency);
+        log::info!("HEX_TRAIN_SELF_PLAY_ITERS={}", cf.iters);
+
         cf
-    }
-
-    fn fetch_config(&self) -> reqwest::Result<ModelConfig> {
-        let url = format!("{}/api/model/{}/config", self.controller_url, self.model_id);
-        self.client.get(&url).send()?.json()
-    }
-
-    fn fetch_model_data(&self, etag: Option<&str>) -> reqwest::Result<FetchModelData> {
-        let url = format!("{}/api/model/{}/params/latest", self.controller_url, self.model_id);
-        let res = {
-            let mut req = self.client.get(&url);
-            if let Some(etag) = etag {
-                req = req.header(header::IF_NONE_MATCH, etag);
-            }
-            req.send()?
-        };
-        if res.status() == StatusCode::NOT_MODIFIED {
-            return Ok(FetchModelData::NotModified);
-        }
-        let new_etag: Option<String> = res
-            .headers()
-            .get(header::ETAG)
-            .map(|x| x.to_str().unwrap().to_owned());
-        let new_data: Vec<u8> = res.bytes()?.to_vec();
-        Ok(FetchModelData::Data(new_etag, new_data))
-    }
-
-    fn upload_positions(&self, pos: Vec<u8>) -> reqwest::Result<()> {
-        let url = format!("{}/api/model/{}/positions", self.controller_url, self.model_id);
-        self.client
-            .post(&url)
-            .body(pos)
-            .send()?
-            .error_for_status()?;
-        Ok(())
     }
 }
 
@@ -205,7 +164,7 @@ fn spawn_uploader(cf: AppConfig, inbox: Receiver<UploaderMsg>) {
 }
 
 fn uploader(cf: AppConfig, inbox: Receiver<UploaderMsg>) {
-    let mut pending: Vec<u8> = Vec::new();
+    let mut pending: BytesMut = Default::default();
 
     loop {
         let go = match inbox.recv_timeout(Duration::from_secs(30)) {
@@ -242,16 +201,24 @@ fn uploader(cf: AppConfig, inbox: Receiver<UploaderMsg>) {
         }
 
         log::info!("flushing uploader buffer ({} positions)", pending.len() / SERIALIZED_LEN);
-        let positions = std::mem::take(&mut pending);
-        cf.upload_positions(positions).unwrap();
+        let positions = std::mem::take(&mut pending).freeze();
+        cf.client
+            .upload_positions(&cf.model_id, positions)
+            .unwrap_or_else(TrainError::unrecoverable);
     }
 }
 
 fn spawn_fetcher(cf: AppConfig) {
-    let config = cf.fetch_config().unwrap();
-    let FetchModelData::Data(etag, data) = cf.fetch_model_data(None).unwrap() else {
-        panic!("got no data");
-    };
+    let config = cf
+        .client
+        .fetch_config(&cf.model_id)
+        .unwrap_or_else(TrainError::unrecoverable);
+    let (etag, data) = cf
+        .client
+        .fetch_model_data(&cf.model_id, None)
+        .unwrap_or_else(TrainError::unrecoverable)
+        .into_data()
+        .expect("fetch without etag should always return data");
     cf.to_evaluator
         .send(EvaluatorMsg::Init(config, data))
         .unwrap();
@@ -261,7 +228,10 @@ fn spawn_fetcher(cf: AppConfig) {
 fn fetcher(cf: AppConfig, mut etag: Option<String>) {
     loop {
         std::thread::sleep(Duration::from_secs(30));
-        let res = cf.fetch_model_data(etag.as_deref()).unwrap();
+        let res = cf
+            .client
+            .fetch_model_data(&cf.model_id, etag.as_deref())
+            .unwrap_or_else(TrainError::unrecoverable);
         if let FetchModelData::Data(new_etag, data) = res {
             etag = new_etag;
             cf.to_evaluator

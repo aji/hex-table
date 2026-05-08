@@ -16,18 +16,239 @@ use axum::{
 };
 use burn::config::Config;
 use iddqd::{IdHashItem, IdHashMap, id_hash_map::RefMut, id_upcast};
-use reqwest::header;
+use reqwest::{blocking::Client, header};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::Digest;
 
 use crate::nn::{
     model::{Model, ModelConfig},
-    train::positions::{Positions, SERIALIZED_LEN},
+    train::{
+        error::{TrainError, TrainResult},
+        positions::{Position, Positions, SERIALIZED_LEN},
+        retry::DEFAULT_RETRY,
+    },
 };
 
 const X_HEX_POSITIONS_CURSOR: header::HeaderName =
     header::HeaderName::from_static("x-hex-positions-cursor");
+
+#[derive(Clone)]
+pub struct ControllerClient {
+    client: Client,
+    controller_url: String,
+}
+
+pub enum FetchModelData {
+    NotModified,
+    Data(Option<String>, Vec<u8>),
+}
+
+impl FetchModelData {
+    pub fn into_data(self) -> Option<(Option<String>, Vec<u8>)> {
+        match self {
+            FetchModelData::NotModified => None,
+            FetchModelData::Data(etag, data) => Some((etag, data)),
+        }
+    }
+}
+
+impl ControllerClient {
+    pub fn new(controller_url: String) -> ControllerClient {
+        if controller_url.ends_with("/") {
+            panic!("controller_url={controller_url:?} cannot end in '/'");
+        }
+
+        ControllerClient {
+            client: Client::new(),
+            controller_url,
+        }
+    }
+
+    pub fn list_models(&self) -> TrainResult<HttpListModels> {
+        DEFAULT_RETRY.attempt(
+            || {
+                Ok(self
+                    .client
+                    .get(&self.controller_url)
+                    .send()?
+                    .error_for_status()?
+                    .json::<HttpListModels>()?)
+            },
+            TrainError::continue_if_retryable,
+        )
+    }
+
+    pub fn create_model(&self, config: ModelConfig) -> TrainResult<()> {
+        let url = format!("{}/api/model", self.controller_url);
+        DEFAULT_RETRY.attempt(
+            || {
+                self.client
+                    .post(&url)
+                    .json(&config)
+                    .send()?
+                    .error_for_status()?;
+                Ok(())
+            },
+            TrainError::continue_if_retryable,
+        )
+    }
+
+    pub fn fetch_config(&self, model_id: &str) -> TrainResult<ModelConfig> {
+        let url = format!("{}/api/model/{}/config", self.controller_url, model_id);
+        DEFAULT_RETRY.attempt(
+            || Ok(self.client.get(&url).send()?.error_for_status()?.json()?),
+            TrainError::continue_if_retryable,
+        )
+    }
+
+    pub fn fetch_model_data(
+        &self,
+        model_id: &str,
+        etag: Option<&str>,
+    ) -> TrainResult<FetchModelData> {
+        let url = format!("{}/api/model/{}/params/latest", self.controller_url, model_id);
+        let res = DEFAULT_RETRY.attempt(
+            || {
+                let mut req = self.client.get(&url);
+                if let Some(etag) = etag {
+                    req = req.header(header::IF_NONE_MATCH, etag);
+                }
+                Ok(req.send()?)
+            },
+            TrainError::continue_if_retryable,
+        )?;
+        if res.status() == StatusCode::NOT_MODIFIED {
+            return Ok(FetchModelData::NotModified);
+        }
+        let new_etag: Option<String> = res
+            .headers()
+            .get(header::ETAG)
+            .into_iter()
+            .flat_map(|x| x.to_str().ok())
+            .map(|x| x.to_owned())
+            .next();
+        let new_data: Vec<u8> = res.bytes()?.to_vec();
+        Ok(FetchModelData::Data(new_etag, new_data))
+    }
+
+    pub fn fetch_positions(
+        &self,
+        model_id: &str,
+        cursor: Option<isize>,
+    ) -> TrainResult<(Option<usize>, Bytes)> {
+        let query = match cursor {
+            Some(n) => format!("?start={n}"),
+            None => "".into(),
+        };
+        let url = format!("{}/api/model/{}/positions{}", self.controller_url, model_id, query);
+        let res = DEFAULT_RETRY
+            .attempt(|| Ok(self.client.get(&url).send()?), TrainError::continue_if_retryable)?;
+
+        let cursor = res
+            .headers()
+            .get(X_HEX_POSITIONS_CURSOR)
+            .into_iter()
+            .flat_map(|x| x.to_str().into_iter())
+            .flat_map(|x| x.parse::<usize>())
+            .next();
+        let data = res.bytes()?;
+
+        if !data.len().is_multiple_of(SERIALIZED_LEN) {
+            return Err("data length not a multiple of SERIALIZED_LEN".into());
+        }
+
+        Ok((cursor, data))
+    }
+
+    pub fn upload_positions(&self, model_id: &str, pos: Bytes) -> TrainResult<()> {
+        let url = format!("{}/api/model/{}/positions", self.controller_url, model_id);
+        DEFAULT_RETRY.attempt(
+            || {
+                self.client
+                    .post(&url)
+                    .body(pos.clone())
+                    .send()?
+                    .error_for_status()?;
+                Ok(())
+            },
+            TrainError::continue_if_retryable,
+        )
+    }
+
+    pub fn upload_params(&self, model_id: &str, data: Vec<u8>) -> TrainResult<()> {
+        let url = format!("{}/api/model/{}/params", self.controller_url, model_id);
+        let data = Bytes::from(data);
+        DEFAULT_RETRY.attempt(
+            || {
+                self.client
+                    .post(&url)
+                    .body(data.clone())
+                    .send()?
+                    .error_for_status()?;
+                Ok(())
+            },
+            TrainError::continue_if_retryable,
+        )
+    }
+}
+
+pub struct PositionsBuffer {
+    capacity: usize,
+    items: Vec<Position>,
+    next: usize,
+    cursor: Option<usize>,
+}
+
+impl PositionsBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            items: Vec::new(),
+            next: 0,
+            cursor: None,
+        }
+    }
+
+    pub fn poll(&mut self, client: &ControllerClient, model_id: &str) -> TrainResult<()> {
+        let cursor = match self.cursor {
+            Some(n) => n as isize,
+            None => -(self.capacity as isize),
+        };
+        let (cursor, data) = client
+            .fetch_positions(model_id, Some(cursor))
+            .unwrap_or_else(TrainError::unrecoverable);
+        self.cursor = cursor;
+
+        for chunk in data.chunks_exact(SERIALIZED_LEN) {
+            let pos = Position::deserialize_from(chunk);
+            if self.items.len() < self.capacity {
+                self.items.push(pos);
+            } else {
+                self.items[self.next] = pos;
+                self.next = (self.next + 1) % self.capacity;
+            }
+        }
+
+        log::info!(
+            "got {} new positions. total={}, cursor={:?}",
+            data.len() / SERIALIZED_LEN,
+            self.items.len(),
+            self.cursor
+        );
+        Ok(())
+    }
+
+    pub fn count(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn sample(&self, n: usize) -> impl Iterator<Item = &'_ Position> {
+        let n0 = if self.items.is_empty() { 0 } else { n };
+        (0..n0)
+            .map(|_| rand::random_range(0..self.items.len()))
+            .map(|i| &self.items[i])
+    }
+}
 
 #[derive(Clone)]
 struct AppConfig {
@@ -214,10 +435,29 @@ impl AppState {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct HttpListModels {
+    pub models: Vec<HttpListModelsItem>,
+}
+#[derive(Serialize, Deserialize)]
+pub struct HttpListModelsItem {
+    pub id: String,
+    pub config: ModelConfig,
+    pub checkpoints: Vec<String>,
+}
 async fn http_get_root(State(app): State<AppState>) -> impl IntoResponse {
-    Json(json!({
-        "root": app.cf.root.display().to_string(),
-    }))
+    let models: Vec<_> = app
+        .models
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|x| HttpListModelsItem {
+            id: x.id.clone(),
+            config: x.config.clone(),
+            checkpoints: x.checkpoints.clone(),
+        })
+        .collect();
+    Json(HttpListModels { models })
 }
 
 async fn http_api_post_model(

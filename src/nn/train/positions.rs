@@ -4,6 +4,8 @@ use std::{
     path::Path,
 };
 
+use bytes::BufMut;
+
 use crate::{bb::Bitboard, nn::transform::Transform};
 
 #[derive(Clone, Debug)]
@@ -40,14 +42,12 @@ impl Position {
         }
     }
 
-    pub fn serialize_into(&self, out: &mut Vec<u8>) {
+    pub fn serialize_into<B: BufMut>(&self, out: &mut B) {
         assert_eq!(self.policy.len(), 121);
-        out.extend_from_slice(&self.board.black.to_le_bytes());
-        out.extend_from_slice(&self.board.white.to_le_bytes());
-        out.extend_from_slice(&self.value.to_le_bytes());
-        for x in self.policy.iter() {
-            out.extend_from_slice(&x.to_le_bytes());
-        }
+        out.put_u128_le(self.board.black);
+        out.put_u128_le(self.board.white);
+        out.put_f32_le(self.value);
+        self.policy.iter().for_each(|x| out.put_f32_le(*x));
     }
 }
 
