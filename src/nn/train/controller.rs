@@ -311,7 +311,7 @@ impl ModelInfo {
             positions,
         };
 
-        let model: Model<burn::backend::Cpu> = info.config.init(&Default::default());
+        let model: Model<burn::backend::NdArray> = info.config.init(&Default::default());
         let bytes = model.into_bytes();
         info.write_checkpoint(&bytes)?;
 
