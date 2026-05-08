@@ -83,14 +83,7 @@ fn main() {
             .open(CSV)
             .unwrap(),
     ));
-    write!(
-        f.lock().unwrap(),
-        "{},{},{}\n",
-        "black_rollouts",
-        "white_rollouts",
-        "result"
-    )
-    .unwrap();
+    write!(f.lock().unwrap(), "{},{},{}\n", "black_rollouts", "white_rollouts", "result").unwrap();
     (0..GAMES).into_par_iter().for_each({
         let f = f.clone();
         move |_| {

@@ -42,6 +42,8 @@
 //! > 6. A fully connected linear layer to a scalar
 //! > 7. A tanh nonlinearity outputting a scalar in the range [−1, 1]
 
+use std::sync::LazyLock;
+
 use burn::{
     Tensor,
     config::Config,
@@ -50,6 +52,7 @@ use burn::{
         BatchNorm, BatchNormConfig, Initializer, Linear, LinearConfig,
         conv::{Conv2d, Conv2dConfig},
     },
+    record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder},
     tensor::{
         Shape, Transaction,
         activation::{leaky_relu, log_softmax, tanh},
@@ -63,9 +66,13 @@ use crate::{
     bb::Bitboard,
     nn::{
         constants::*,
+        train::positions::Position,
         transform::{Transform, Transforms, Transpose},
     },
 };
+
+pub static BYTES_RECORDER: LazyLock<NamedMpkBytesRecorder<FullPrecisionSettings>> =
+    LazyLock::new(Default::default);
 
 /// A convolution of a 2D hexagonal grid
 ///
@@ -358,6 +365,14 @@ pub struct EvalResult {
 }
 
 impl<B: Backend> Model<B> {
+    pub fn load_bytes(self, bytes: Vec<u8>, device: &B::Device) -> Model<B> {
+        self.load_record(BYTES_RECORDER.load(bytes, device).unwrap())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        BYTES_RECORDER.record(self.into_record(), ()).unwrap()
+    }
+
     pub fn forward(&self, board: Tensor<B, 4>) -> (Tensor<B, 2>, Tensor<B, 1>) {
         let x = self
             .residual
@@ -430,6 +445,10 @@ impl<B: Backend> Model<B> {
 }
 
 impl ModelConfig {
+    pub fn id(&self) -> String {
+        format!("v0-{}-{}-{}", self.conv_layers, self.conv_channels, self.value_hidden)
+    }
+
     pub fn init<B: Backend>(&self, device: &B::Device) -> Model<B> {
         Model {
             input: ConvInputBlockConfig::new(self.conv_channels).init(device),
@@ -469,18 +488,18 @@ pub struct TrainInput<B: Backend> {
     values: Tensor<B, 1>,
 }
 
-pub fn examples_to_input<B: Backend>(
-    examples: impl Iterator<Item = (Bitboard, Vec<f32>, f32)>,
+pub fn positions_to_input<'a, B: Backend>(
+    positions: impl Iterator<Item = &'a Position>,
     device: &B::Device,
 ) -> TrainInput<B> {
     let mut boards: Vec<f32> = Vec::new();
     let mut policies: Vec<f32> = Vec::new();
     let mut values: Vec<f32> = Vec::new();
 
-    for (board, policy, value) in examples {
-        boards.extend(board_to_contiguous(board));
-        policies.extend(policy);
-        values.push(value);
+    for pos in positions {
+        boards.extend(board_to_contiguous(pos.board));
+        policies.extend(pos.policy.iter().copied());
+        values.push(pos.value);
     }
 
     let num_boards = values.len();

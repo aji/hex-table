@@ -27,14 +27,12 @@ struct MctsEval;
 
 impl Evaluator for MctsEval {
     fn call(&self, board: Bitboard) -> EvalResult {
-        let out = mcts2::search(
-            board,
-            board.depth(),
-            |stats: &mcts2::MctsStats<Bitboard>| match stats.num_sims > 10000 {
+        let out = mcts2::search(board, board.depth(), |stats: &mcts2::MctsStats<Bitboard>| {
+            match stats.num_sims > 10000 {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
-            },
-        );
+            }
+        });
         EvalResult {
             policy: out.policy,
             value: out.value,

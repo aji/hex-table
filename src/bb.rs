@@ -239,7 +239,7 @@ fn bb_fill(start: u128, traversable: u128) -> u128 {
 pub struct BitboardSet(u128);
 
 /// The main bitboard struct. Implements `Copy` and most functions are `self`
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Bitboard {
     pub black: u128,
     pub white: u128,

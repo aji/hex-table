@@ -23,9 +23,10 @@ use hex_table::{
     nn::{
         model::{
             EvalRequest, EvalResult, Model, ModelConfig, ModelRecord, ModelRecordItem,
-            examples_to_input,
+            positions_to_input,
         },
         search::{Evaluator, search_with_evaluator},
+        train::positions::Position,
         transform::{Transform, Transforms, Transpose},
     },
 };
@@ -44,7 +45,7 @@ const SELF_PLAY_SAMPLE_THRESHOLD: usize = 30;
 struct Context {
     config: ModelConfig,
     latest: Arc<RwLock<ModelRecordItem<Back, Prec>>>,
-    examples: Arc<RwLock<ExampleBuffer>>,
+    positions: Arc<RwLock<PositionBuffer>>,
     evaluator: Sender<EvaluatorMsg>,
 }
 
@@ -55,7 +56,7 @@ impl Context {
         Context {
             config: cf,
             latest: Arc::new(RwLock::new(item)),
-            examples: Arc::new(RwLock::new(ExampleBuffer::new())),
+            positions: Arc::new(RwLock::new(PositionBuffer::new())),
             evaluator,
         }
     }
@@ -76,15 +77,15 @@ impl Context {
         *self.latest.write().unwrap() = item;
     }
 
-    fn num_examples(&self) -> usize {
-        self.examples.read().unwrap().examples.len()
+    fn num_positions(&self) -> usize {
+        self.positions.read().unwrap().positions.len()
     }
 
-    fn load_examples(&self, count: usize) -> Vec<Example> {
-        self.examples
+    fn load_positions(&self, count: usize) -> Vec<Position> {
+        self.positions
             .read()
             .unwrap()
-            .examples
+            .positions
             .sample(&mut rand::rng(), count)
             .cloned()
             .collect()
@@ -110,21 +111,21 @@ impl Context {
             None => panic!(),
         };
 
-        let mut examples = self.examples.write().unwrap();
+        let mut positions = self.positions.write().unwrap();
         for (board, policy) in log.into_iter() {
-            let example = match board.sente() {
-                true => Example {
+            let position = match board.sente() {
+                true => Position {
                     board,
                     policy,
                     value,
                 },
-                false => Example {
+                false => Position {
                     board: transpose.apply_board(board),
                     policy: transpose.apply_policy(policy),
                     value: transpose.apply_value(value),
                 },
             };
-            examples.push(example);
+            positions.push(position);
         }
     }
 }
@@ -142,36 +143,29 @@ impl<'a> Evaluator for BatchEvaluator<'a> {
     }
 }
 
-struct ExampleBuffer {
-    examples: Vec<Example>,
+struct PositionBuffer {
+    positions: Vec<Position>,
     capacity: usize,
     next: usize,
 }
 
-impl ExampleBuffer {
+impl PositionBuffer {
     fn new() -> Self {
         Self {
-            examples: Vec::new(),
+            positions: Vec::new(),
             capacity: 100000,
             next: 0,
         }
     }
 
-    fn push(&mut self, example: Example) {
-        if self.examples.len() < self.capacity {
-            self.examples.push(example);
+    fn push(&mut self, position: Position) {
+        if self.positions.len() < self.capacity {
+            self.positions.push(position);
         } else {
-            self.examples[self.next] = example;
+            self.positions[self.next] = position;
             self.next = (self.next + 1) % self.capacity;
         }
     }
-}
-
-#[derive(Clone)]
-struct Example {
-    board: Bitboard,
-    policy: Vec<f32>,
-    value: f32,
 }
 
 type EvaluatorRet = SyncSender<EvalResult>;
@@ -232,7 +226,7 @@ fn prefill(ctx: Context) {
     let mut last_print = Instant::now();
     for i in 0..n {
         if last_print.elapsed().as_millis() > 200 {
-            println!("n={} prefill {}% complete", ctx.num_examples(), i * 100 / n);
+            println!("n={} prefill {}% complete", ctx.num_positions(), i * 100 / n);
             last_print = Instant::now();
         }
         ctx.play(|board| {
@@ -254,11 +248,7 @@ fn self_play(idx: usize, ctx: Context) {
         ctx.play(|board| {
             let depth = board.depth();
             if depth % 10 == 0 {
-                println!(
-                    "n={} self play {idx:03} move {:3}",
-                    ctx.num_examples(),
-                    board.depth()
-                );
+                println!("n={} self play {idx:03} move {:3}", ctx.num_positions(), board.depth());
             }
             let limit = 600 + idx;
             let eval = BatchEvaluator(&ctx);
@@ -289,19 +279,16 @@ fn optimizer(ctx: Context) {
     let mut last_print = Instant::now();
 
     for iter in 0.. {
-        let examples = loop {
-            let examples = ctx.load_examples(256);
-            if examples.len() >= 256 {
-                break examples_to_input(
-                    examples.into_iter().map(|e| (e.board, e.policy, e.value)),
-                    &device,
-                );
+        let positions = loop {
+            let positions = ctx.load_positions(256);
+            if positions.len() >= 256 {
+                break positions_to_input(positions.iter(), &device);
             }
             println!("optimizer waiting a bit");
             std::thread::sleep(Duration::from_millis(500));
         };
 
-        let loss = model.forward_loss(examples);
+        let loss = model.forward_loss(positions);
         if last_print.elapsed() > Duration::from_millis(500) {
             println!(
                 "iter={iter:?} loss={:10.8?} params={:?}",
