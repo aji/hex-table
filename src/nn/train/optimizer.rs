@@ -30,6 +30,7 @@ struct AppConfig {
     upload_interval_secs: u64,
     batch_size: usize,
     momentum: f64,
+    learning_rate: f64,
     positions: Arc<Mutex<PositionsBuffer>>,
     total_iters: Arc<AtomicUsize>,
 }
@@ -38,37 +39,42 @@ impl AppConfig {
     fn load(to_uploader: Sender<UploaderMsg>) -> Self {
         let controller_url = std::env::var("HEX_TRAIN_CONTROLLER_URL")
             .expect("HEX_TRAIN_CONTROLLER_URL is a required env var");
-        let max_positions = std::env::var("HEX_TRAIN_MAX_POSITIONS")
+        let max_positions = std::env::var("HEX_TRAIN_OPTIMIZER_MAX_POSITIONS")
             .unwrap_or("500000".into())
             .parse::<usize>()
-            .expect("HEX_TRAIN_MAX_POSITIONS should parse as usize");
+            .expect("HEX_TRAIN_OPTIMIZER_MAX_POSITIONS should parse as usize");
         log::info!("HEX_TRAIN_CONTROLLER_URL={}", controller_url);
-        log::info!("HEX_TRAIN_MAX_POSITIONS={}", max_positions);
+        log::info!("HEX_TRAIN_OPTIMIZER_MAX_POSITIONS={}", max_positions);
 
         let cf = Self {
             client: ControllerClient::new(controller_url),
             to_uploader,
             model_id: std::env::var("HEX_TRAIN_MODEL_ID")
                 .expect("HEX_TRAIN_MODEL_ID is a required env var"),
-            upload_interval_secs: std::env::var("HEX_TRAIN_UPLOAD_INTERVAL")
+            upload_interval_secs: std::env::var("HEX_TRAIN_OPTIMIZER_UPLOAD_INTERVAL")
                 .unwrap_or("300".into())
                 .parse::<u64>()
-                .expect("HEX_TRAIN_UPLOAD_INTERVAL should parse as u64"),
-            batch_size: std::env::var("HEX_TRAIN_BATCH_SIZE")
+                .expect("HEX_TRAIN_OPTIMIZER_UPLOAD_INTERVAL should parse as u64"),
+            batch_size: std::env::var("HEX_TRAIN_OPTIMIZER_BATCH_SIZE")
                 .unwrap_or("256".into())
                 .parse::<usize>()
-                .expect("HEX_TRAIN_BATCH_SIZE should parse as usize"),
-            momentum: std::env::var("HEX_TRAIN_MOMENTUM")
+                .expect("HEX_TRAIN_OPTIMIZER_BATCH_SIZE should parse as usize"),
+            momentum: std::env::var("HEX_TRAIN_OPTIMIZER_MOMENTUM")
                 .unwrap_or("0.7".into())
                 .parse::<f64>()
-                .expect("HEX_TRAIN_MOMENTUM should parse as f64"),
+                .expect("HEX_TRAIN_OPTIMIZER_MOMENTUM should parse as f64"),
+            learning_rate: std::env::var("HEX_TRAIN_OPTIMIZER_LEARNING_RATE")
+                .unwrap_or("0.02".into())
+                .parse::<f64>()
+                .expect("HEX_TRAIN_OPTIMIZER_LEARNING_RATE should parse as f64"),
             positions: Arc::new(Mutex::new(PositionsBuffer::new(max_positions))),
             total_iters: Arc::new(AtomicUsize::new(0)),
         };
         log::info!("HEX_TRAIN_MODEL_ID={}", cf.model_id);
-        log::info!("HEX_TRAIN_UPLOAD_INTERVAL={}", cf.upload_interval_secs);
-        log::info!("HEX_TRAIN_BATCH_SIZE={}", cf.batch_size);
-        log::info!("HEX_TRAIN_MOMENTUM={}", cf.momentum);
+        log::info!("HEX_TRAIN_OPTIMIZER_UPLOAD_INTERVAL={}", cf.upload_interval_secs);
+        log::info!("HEX_TRAIN_OPTIMIZER_BATCH_SIZE={}", cf.batch_size);
+        log::info!("HEX_TRAIN_OPTIMIZER_MOMENTUM={}", cf.momentum);
+        log::info!("HEX_TRAIN_OPTIMIZER_LEARNING_RATE={}", cf.learning_rate);
 
         cf
     }
@@ -92,14 +98,13 @@ fn optimizer(cf: AppConfig) {
         .with_momentum(Some(MomentumConfig::new().with_momentum(cf.momentum)))
         .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
         .init::<Wgpu, Model<Wgpu>>();
-    let lr = |_| 1e-2;
 
     let mut last_print = Instant::now();
     let mut last_upload = Instant::now();
     let mut loss_total = 0.0;
     let mut loss_count = 0;
 
-    for iter in 0.. {
+    for _ in 0.. {
         let positions = {
             let buf = cf.positions.lock().unwrap();
             if buf.count() < cf.batch_size {
@@ -124,7 +129,7 @@ fn optimizer(cf: AppConfig) {
 
         let grad = loss.backward();
         let grad = GradientsParams::from_grads(grad, &model);
-        model = optim.step(lr(iter), model, grad);
+        model = optim.step(cf.learning_rate, model, grad);
 
         if last_upload.elapsed() >= Duration::from_secs(cf.upload_interval_secs) {
             last_upload = Instant::now();
