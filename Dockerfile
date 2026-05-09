@@ -9,6 +9,9 @@ RUN apt-get update \
         ca-certificates \
         libvulkan1 \
         vulkan-tools \
+        libx11-6 \
+        libxext6 \
+        libegl1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Courtesy of Claude:
