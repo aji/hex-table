@@ -1,5 +1,6 @@
 use std::{
-    io,
+    fs::File,
+    io::{self, Write},
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -19,6 +20,7 @@ use iddqd::{IdHashItem, IdHashMap, id_hash_map::RefMut, id_upcast};
 use reqwest::{blocking::Client, header};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use time::{UtcDateTime, format_description::well_known::Rfc3339};
 
 use crate::nn::{
     model::{Model, ModelConfig},
@@ -29,6 +31,8 @@ use crate::nn::{
     },
 };
 
+const X_HEX_THIS_ITERS: header::HeaderName = header::HeaderName::from_static("x-hex-this-iters");
+const X_HEX_THIS_LOSS: header::HeaderName = header::HeaderName::from_static("x-hex-this-loss");
 const X_HEX_POSITIONS_CURSOR: header::HeaderName =
     header::HeaderName::from_static("x-hex-positions-cursor");
 
@@ -175,13 +179,21 @@ impl ControllerClient {
         )
     }
 
-    pub fn upload_params(&self, model_id: &str, data: Vec<u8>) -> TrainResult<()> {
+    pub fn upload_params(
+        &self,
+        model_id: &str,
+        data: Vec<u8>,
+        iters: usize,
+        loss: f32,
+    ) -> TrainResult<()> {
         let url = format!("{}/api/model/{}/params", self.controller_url, model_id);
         let data = Bytes::from(data);
         DEFAULT_RETRY.attempt(
             || {
                 self.client
                     .post(&url)
+                    .header(X_HEX_THIS_ITERS, iters)
+                    .header(X_HEX_THIS_LOSS, format!("{loss:.8}"))
                     .body(data.clone())
                     .send()?
                     .error_for_status()?;
@@ -280,6 +292,7 @@ impl AppConfig {
 struct ModelInfo {
     id: String,
     root: PathBuf,
+    log: File,
     config: ModelConfig,
     checkpoints: Vec<String>,
     positions: Positions,
@@ -301,11 +314,18 @@ impl ModelInfo {
         std::fs::create_dir_all(&root)?;
         config.save(root.join("config.json"))?;
 
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(root.join("train-log.txt"))?;
+
         let checkpoints = Vec::new();
         let positions = Positions::open(&root.join("positions"))?;
         let mut info = ModelInfo {
             id,
             root,
+            log,
             config,
             checkpoints,
             positions,
@@ -313,7 +333,7 @@ impl ModelInfo {
 
         let model: Model<burn::backend::NdArray> = info.config.init(&Default::default());
         let bytes = model.into_bytes();
-        info.write_checkpoint(&bytes)?;
+        info.write_checkpoint(&bytes, None, None)?;
 
         Ok(info)
     }
@@ -337,11 +357,19 @@ impl ModelInfo {
                 // ignore silently
             } else if file_name == "positions" {
                 // ignore silently
+            } else if file_name == "train-log.txt" {
+                // ignore silently
             } else {
                 log::warn!("skipping {}: not sure what this is", path.display());
             }
         }
         checkpoints.sort();
+
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(root.join("train-log.txt"))?;
 
         let config = ModelConfig::load(&root.join("config.json")).map_err(io::Error::other)?;
         let positions: Positions = Positions::open(&root.join("positions"))?;
@@ -349,6 +377,7 @@ impl ModelInfo {
         Ok(ModelInfo {
             id,
             root,
+            log,
             config,
             checkpoints,
             positions,
@@ -359,15 +388,39 @@ impl ModelInfo {
         self.checkpoints.last().map(|x| self.root.join(x))
     }
 
-    fn write_checkpoint(&mut self, data: &[u8]) -> io::Result<String> {
+    fn write_checkpoint(
+        &mut self,
+        data: &[u8],
+        this_iters: Option<usize>,
+        this_loss: Option<f32>,
+    ) -> io::Result<String> {
         let hash: u32 = {
             let bytes: [u8; 32] = sha2::Sha256::digest(data).try_into().unwrap();
             u32::from_be_bytes(bytes[..4].try_into().unwrap())
         };
         let name = format!("checkpoint-{:05}-{:08x}", self.checkpoints.len(), hash);
+
         self.checkpoints.push(name.clone());
         std::fs::write(self.root.join(&name), data)?;
         log::info!("{}: wrote {}", self.id, name);
+
+        let log_time = UtcDateTime::now().format(&Rfc3339).unwrap();
+        let log_iters = match this_iters {
+            Some(it) => format!("{it}"),
+            None => String::new(),
+        };
+        let log_loss = match this_loss {
+            Some(it) => format!("{it:.8}"),
+            None => String::new(),
+        };
+        write!(self.log, "{log_time},{name},{log_iters},{log_loss},{}\n", self.positions.len())
+            .inspect_err(|e| log::warn!("failed to write to log: {e}"))
+            .ok();
+        self.log
+            .flush()
+            .inspect_err(|e| log::warn!("failed to flush log: {e}"))
+            .ok();
+
         Ok(name)
     }
 }
@@ -483,9 +536,18 @@ async fn http_api_get_model_config(
 async fn http_api_post_model_params(
     State(app): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let Some(res) = app.with_model_mut(&id, |mut m| m.write_checkpoint(&body)) else {
+    let iters = headers
+        .get(X_HEX_THIS_ITERS)
+        .and_then(|x| x.to_str().ok())
+        .and_then(|x| x.parse::<usize>().ok());
+    let loss = headers
+        .get(X_HEX_THIS_LOSS)
+        .and_then(|x| x.to_str().ok())
+        .and_then(|x| x.parse::<f32>().ok());
+    let Some(res) = app.with_model_mut(&id, |mut m| m.write_checkpoint(&body, iters, loss)) else {
         return Err(StatusCode::NOT_FOUND);
     };
     let Ok(_) = res else {
@@ -495,9 +557,9 @@ async fn http_api_post_model_params(
 }
 
 async fn http_api_get_model_params_latest(
-    headers: HeaderMap,
     State(app): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let Some(path) = app.with_model(&id, |m| m.path_to_latest()).flatten() else {
         return Err(StatusCode::NOT_FOUND);

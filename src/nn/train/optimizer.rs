@@ -102,6 +102,8 @@ fn optimizer(cf: AppConfig) {
         .init::<Wgpu, Model<Wgpu>>();
 
     let mut last_upload = Instant::now();
+    let mut loss_total = 0.0;
+    let mut loss_count = 0;
 
     for _ in 0.. {
         let positions = {
@@ -117,17 +119,24 @@ fn optimizer(cf: AppConfig) {
 
         let loss = model.forward_loss(positions);
         cf.total_iters.fetch_add(1, Ordering::Relaxed);
-        cf.losses.lock().unwrap().push(loss.clone().into_scalar());
+
+        let loss_value = loss.clone().into_scalar();
+        cf.losses.lock().unwrap().push(loss_value);
+        loss_total += loss_value;
+        loss_count += 1;
 
         let grad = loss.backward();
         let grad = GradientsParams::from_grads(grad, &model);
         model = optim.step(cf.learning_rate, model, grad);
 
         if last_upload.elapsed() >= Duration::from_secs(cf.upload_interval_secs) {
+            let loss = loss_total / loss_count as f32;
+            loss_total = 0.0;
+            loss_count = 0;
             last_upload = Instant::now();
-            log::info!("uploading new model checkpoint");
+            log::info!("uploading new model checkpoint loss={loss:.8}");
             cf.to_uploader
-                .send(UploaderMsg::Queue(model.clone().into_bytes()))
+                .send(UploaderMsg::Queue(model.clone().into_bytes(), loss))
                 .unwrap();
         }
     }
@@ -149,7 +158,7 @@ fn positions_poller(cf: AppConfig) {
 }
 
 enum UploaderMsg {
-    Queue(Vec<u8>),
+    Queue(Vec<u8>, f32),
 }
 
 fn spawn_uploader(cf: AppConfig, inbox: Receiver<UploaderMsg>) {
@@ -157,11 +166,17 @@ fn spawn_uploader(cf: AppConfig, inbox: Receiver<UploaderMsg>) {
 }
 
 fn uploader(cf: AppConfig, inbox: Receiver<UploaderMsg>) {
+    let mut last_iters = 0;
     loop {
-        let Ok(UploaderMsg::Queue(data)) = inbox.recv() else {
+        let Ok(UploaderMsg::Queue(data, loss)) = inbox.recv() else {
             panic!();
         };
-        if let Err(e) = cf.client.upload_params(&cf.model_id, data) {
+
+        let now_iters = cf.total_iters.load(Ordering::Relaxed);
+        let iters = now_iters - last_iters;
+        last_iters = now_iters;
+
+        if let Err(e) = cf.client.upload_params(&cf.model_id, data, iters, loss) {
             log::error!("failed to upload params: {e}");
         }
     }
