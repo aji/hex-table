@@ -36,6 +36,10 @@ const X_HEX_THIS_LOSS: header::HeaderName = header::HeaderName::from_static("x-h
 const X_HEX_POSITIONS_CURSOR: header::HeaderName =
     header::HeaderName::from_static("x-hex-positions-cursor");
 
+fn log_error<E: std::fmt::Display>(error: &E) {
+    log::error!("{error}");
+}
+
 #[derive(Clone)]
 pub struct ControllerClient {
     client: Client,
@@ -546,7 +550,7 @@ async fn http_api_post_model_params(
     let Some(res) = app.with_model_mut(&id, |mut m| m.write_checkpoint(&body, iters, loss)) else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let Ok(_) = res else {
+    let Ok(_) = res.inspect_err(log_error) else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     Ok(())
@@ -574,7 +578,7 @@ async fn http_api_get_model_params_latest(
         return Err(StatusCode::NOT_MODIFIED);
     }
 
-    let Ok(data) = std::fs::read(&path) else {
+    let Ok(data) = std::fs::read(&path).inspect_err(log_error) else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     Ok(([(header::ETAG, etag)], data))
@@ -591,7 +595,7 @@ async fn http_api_post_positions(
     let Some(res) = app.with_model_mut(&id, |mut m| m.positions.push_serialized_many(&body)) else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let Ok(_) = res else {
+    let Ok(_) = res.inspect_err(log_error) else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     Ok(())
@@ -617,7 +621,7 @@ async fn http_api_get_positions(
     }) else {
         return Err(StatusCode::NOT_FOUND);
     };
-    let Ok((data, end)) = res else {
+    let Ok((data, end)) = res.inspect_err(|e| log::error!("{e}")) else {
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
     Ok(([(X_HEX_POSITIONS_CURSOR, format!("{end}"))], data))

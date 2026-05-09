@@ -99,7 +99,7 @@ impl Positions {
     ) -> io::Result<(Vec<u8>, usize)> {
         let idx1 = end.unwrap_or(self.count).min(self.count);
         let idx0 = start.min(idx1);
-        let idx1 = idx1.min(idx0 + MAX_READ_COUNT);
+        let idx1 = idx1.min(idx0 + MAX_READ_COUNT).min(self.count);
 
         let byte1 = idx1 * SERIALIZED_LEN;
         let byte0 = idx0 * SERIALIZED_LEN;
