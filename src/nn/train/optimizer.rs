@@ -32,6 +32,7 @@ struct AppConfig {
     momentum: f64,
     learning_rate: f64,
     positions: Arc<Mutex<PositionsBuffer>>,
+    losses: Arc<Mutex<Vec<f32>>>,
     total_iters: Arc<AtomicUsize>,
 }
 
@@ -68,6 +69,7 @@ impl AppConfig {
                 .parse::<f64>()
                 .expect("HEX_TRAIN_OPTIMIZER_LEARNING_RATE should parse as f64"),
             positions: Arc::new(Mutex::new(PositionsBuffer::new(max_positions))),
+            losses: Arc::new(Mutex::new(Vec::new())),
             total_iters: Arc::new(AtomicUsize::new(0)),
         };
         log::info!("HEX_TRAIN_MODEL_ID={}", cf.model_id);
@@ -99,10 +101,7 @@ fn optimizer(cf: AppConfig) {
         .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
         .init::<Wgpu, Model<Wgpu>>();
 
-    let mut last_print = Instant::now();
     let mut last_upload = Instant::now();
-    let mut loss_total = 0.0;
-    let mut loss_count = 0;
 
     for _ in 0.. {
         let positions = {
@@ -118,14 +117,7 @@ fn optimizer(cf: AppConfig) {
 
         let loss = model.forward_loss(positions);
         cf.total_iters.fetch_add(1, Ordering::Relaxed);
-        loss_total += loss.clone().into_scalar();
-        loss_count += 1;
-        if last_print.elapsed() >= Duration::from_secs(1) {
-            log::info!("loss={:10.8}", loss_total / loss_count as f32);
-            last_print = Instant::now();
-            loss_total = 0.0;
-            loss_count = 0;
-        }
+        cf.losses.lock().unwrap().push(loss.clone().into_scalar());
 
         let grad = loss.backward();
         let grad = GradientsParams::from_grads(grad, &model);
@@ -185,8 +177,16 @@ pub fn main() {
 
     let mut log_iters = CounterLog::new();
     loop {
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_secs(60));
         log_iters.report(&cf.total_iters);
-        log::info!("iters={} ({:.1}/s)", log_iters.latest(), log_iters.per_second());
+        let losses = std::mem::take(&mut *cf.losses.lock().unwrap());
+        let loss_count = losses.len() as f32;
+        let loss = losses.into_iter().sum::<f32>() / loss_count;
+        log::info!(
+            "iters={:07} ({:.2}/s) loss={:.8}",
+            log_iters.latest(),
+            log_iters.per_second(),
+            loss
+        );
     }
 }
