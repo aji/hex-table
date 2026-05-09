@@ -110,7 +110,7 @@ fn optimizer(cf: AppConfig) {
             if buf.count() < cf.batch_size {
                 log::info!("waiting a bit for position buffer to fill");
                 std::mem::drop(buf);
-                std::thread::sleep(Duration::from_secs(10));
+                std::thread::sleep(Duration::from_secs(60));
                 continue;
             }
             positions_to_input(buf.sample(cf.batch_size), &device)
@@ -152,7 +152,7 @@ fn positions_poller(cf: AppConfig) {
             .unwrap()
             .poll(&cf.client, &cf.model_id)
             .unwrap_or_else(TrainError::unrecoverable);
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_secs(60));
     }
 }
 
