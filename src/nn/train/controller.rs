@@ -221,7 +221,7 @@ impl PositionsBuffer {
         }
     }
 
-    pub fn poll(&mut self, client: &ControllerClient, model_id: &str) -> TrainResult<()> {
+    pub fn poll(&mut self, client: &ControllerClient, model_id: &str) -> TrainResult<usize> {
         let cursor = match self.cursor {
             Some(n) => n as isize,
             None => -(self.capacity as isize),
@@ -241,13 +241,9 @@ impl PositionsBuffer {
             }
         }
 
-        log::info!(
-            "got {} new positions. total={}, cursor={:?}",
-            data.len() / SERIALIZED_LEN,
-            self.items.len(),
-            self.cursor
-        );
-        Ok(())
+        let n = data.len() / SERIALIZED_LEN;
+        log::info!("got {n} new positions. total={}, cursor={:?}", self.items.len(), self.cursor);
+        Ok(n)
     }
 
     pub fn count(&self) -> usize {

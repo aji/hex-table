@@ -30,7 +30,7 @@ impl TrainError {
 
     pub fn unrecoverable<T>(this: TrainError) -> T {
         log::error!("unrecoverable: {this}");
-        panic!("unrecoverable: {this}");
+        std::process::exit(15)
     }
 }
 

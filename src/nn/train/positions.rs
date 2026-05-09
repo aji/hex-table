@@ -16,6 +16,7 @@ pub struct Position {
 }
 
 pub const SERIALIZED_LEN: usize = 2 * 16 + 4 + 121 * 4;
+const MAX_READ_COUNT: usize = 1_000_000 / SERIALIZED_LEN;
 
 fn chunk_at<const N: usize>(bytes: &[u8], i: usize) -> [u8; N] {
     bytes[i..i + N].try_into().unwrap()
@@ -98,6 +99,7 @@ impl Positions {
     ) -> io::Result<(Vec<u8>, usize)> {
         let idx1 = end.unwrap_or(self.count).min(self.count);
         let idx0 = start.min(idx1);
+        let idx1 = idx1.min(idx0 + MAX_READ_COUNT);
 
         let byte1 = idx1 * SERIALIZED_LEN;
         let byte0 = idx0 * SERIALIZED_LEN;

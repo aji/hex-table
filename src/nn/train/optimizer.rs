@@ -148,12 +148,15 @@ fn spawn_poller(cf: AppConfig) {
 
 fn positions_poller(cf: AppConfig) {
     loop {
-        cf.positions
+        let n = cf
+            .positions
             .lock()
             .unwrap()
             .poll(&cf.client, &cf.model_id)
             .unwrap_or_else(TrainError::unrecoverable);
-        std::thread::sleep(Duration::from_secs(60));
+        if n == 0 {
+            std::thread::sleep(Duration::from_secs(60));
+        }
     }
 }
 
