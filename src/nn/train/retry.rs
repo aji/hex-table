@@ -13,13 +13,14 @@ impl RetryStrategy {
         F: Fn() -> Result<T, E>,
         G: Fn(E) -> ControlFlow<E, ()>,
     {
-        for delay in self.into_iter() {
+        for (attempt, delay) in self.into_iter().enumerate() {
             if let Some(delay) = delay {
                 log::warn!("retrying after {delay:?}");
                 std::thread::sleep(delay);
             }
             match body() {
                 Ok(res) => return Ok(res),
+                Err(_) if attempt == 0 => continue,
                 Err(e) => match inspect_error(e) {
                     ControlFlow::Break(e) => return Err(e),
                     ControlFlow::Continue(_) => continue,

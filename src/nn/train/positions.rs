@@ -16,7 +16,7 @@ pub struct Position {
 }
 
 pub const SERIALIZED_LEN: usize = 2 * 16 + 4 + 121 * 4;
-const MAX_READ_COUNT: usize = 1_000_000 / SERIALIZED_LEN;
+const MAX_READ_COUNT: usize = 5_000_000 / SERIALIZED_LEN;
 
 fn chunk_at<const N: usize>(bytes: &[u8], i: usize) -> [u8; N] {
     bytes[i..i + N].try_into().unwrap()
