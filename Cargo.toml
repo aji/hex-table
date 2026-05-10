@@ -24,8 +24,22 @@ time = { version = "0.3.47", features = ["formatting"] }
 tokio = { version = "1.52.2", features = ["full"] }
 
 [features]
+default = ["nn"]
 ui = ["dep:ggez"]
+nn = []
 
 [[bin]]
 name = "play"
 required-features = ["ui"]
+
+[[bin]]
+name = "train-cli"
+required-features = ["nn"]
+
+[[bin]]
+name = "train-daemon"
+required-features = ["nn"]
+
+[[bin]]
+name = "train-local"
+required-features = ["nn"]
