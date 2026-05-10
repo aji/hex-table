@@ -9,7 +9,7 @@ use rayon::prelude::*;
 
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
-    mcts2::{self, MctsStats},
+    mcts::{self, MctsStats},
 };
 
 fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
@@ -25,7 +25,7 @@ fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
             true => black_rollouts,
             false => white_rollouts,
         };
-        let out = mcts2::search(board, turn, |stats: &MctsStats<Bitboard>| {
+        let out = mcts::search(board, turn, |stats: &MctsStats<Bitboard>| {
             match stats.num_sims > max_sims {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
@@ -40,7 +40,7 @@ fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
 fn one_turn(game: Bitboard, depth: usize) -> Bitboard {
     let start_search = Instant::now();
     let init_state = game;
-    let out = mcts2::search(init_state, depth, |stats: &MctsStats<Bitboard>| {
+    let out = mcts::search(init_state, depth, |stats: &MctsStats<Bitboard>| {
         let elapsed = start_search.elapsed();
         print!("\x1b[H\x1b[J");
         println!("{}", BitboardPretty(&init_state));

@@ -6,7 +6,7 @@ use std::{
 
 use crate::{
     bb::Bitboard,
-    mcts2::{self, MctsStats},
+    mcts::{self, MctsStats},
     util::{NumPretty, SizePretty},
 };
 
@@ -60,7 +60,7 @@ pub fn mcts_thinking_task(task: ThinkHandle) {
         (data.board, data.turn)
     };
 
-    let out = mcts2::search(board, turn, {
+    let out = mcts::search(board, turn, {
         let start = Instant::now();
         let task = task.clone();
 

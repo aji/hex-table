@@ -19,7 +19,7 @@ use burn::{
 };
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
-    mcts2,
+    mcts,
     nn::{
         model::{
             EvalRequest, EvalResult, Model, ModelConfig, ModelRecord, ModelRecordItem,
@@ -231,7 +231,7 @@ fn prefill(ctx: Context) {
         }
         ctx.play(|board| {
             let depth = board.depth();
-            let out = mcts2::search(board, depth, |stats: &mcts2::MctsStats<Bitboard>| {
+            let out = mcts::search(board, depth, |stats: &mcts::MctsStats<Bitboard>| {
                 match stats.num_sims > 50000 {
                     true => ControlFlow::Break(()),
                     false => ControlFlow::Continue(()),

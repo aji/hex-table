@@ -1,213 +1,231 @@
-use std::{
-    cmp::Ordering,
-    f32,
-    io::Write,
-    time::{Duration, Instant},
-};
+use std::ops::ControlFlow;
 
-const PRINT_INTERVAL: Duration = Duration::from_millis(200);
-const EXPLORE: f32 = f32::consts::SQRT_2;
+use bumpalo::Bump;
 
-pub trait MctsState: Sized {
-    type Move: Copy + PartialEq;
+use crate::util::Finite;
 
+pub trait MctsState: Copy + Sized {
     fn init() -> Self;
 
+    fn max_move_count() -> usize;
+
+    /// Return Some(true) for sente win, Some(false) for gote win, and None for
+    /// intermediate game states.
     fn terminal(&self) -> Option<bool>;
 
+    /// Return true for sente win and false for gote win.
     fn rollout(&self) -> bool;
 
-    fn children(&self) -> impl Iterator<Item = (Self::Move, Self)>;
+    fn children(&self) -> impl ExactSizeIterator<Item = (usize, Self)>;
 }
 
-pub struct MctsTree<S: MctsState> {
-    last_print: Instant,
-    root_depth: usize,
-    root: MctsNode<S>,
-}
-
-enum MctsChildren<S: MctsState> {
-    Unknown,
-    Leaf(bool),
-    List(Vec<(S::Move, MctsNode<S>)>),
-}
-
-struct MctsNode<S: MctsState> {
+struct MctsNode<'a, S> {
+    action: usize,
     state: S,
-    sente_wins: usize,
-    rollouts: usize,
-    children: MctsChildren<S>,
+    children: Option<&'a mut [MctsNode<'a, S>]>,
+    num_wins: u32,
+    num_sims: u32,
+    terminal: Option<bool>,
 }
 
-impl<S: MctsState> MctsTree<S> {
-    pub fn new() -> MctsTree<S> {
-        MctsTree {
-            last_print: Instant::now(),
-            root_depth: 0,
-            root: MctsNode {
-                state: S::init(),
-                sente_wins: 0,
-                rollouts: 1,
-                children: MctsChildren::Unknown,
-            },
+#[derive(Copy, Clone, Debug)]
+struct MctsBackprop {
+    num_wins: u32,
+    num_sims: u32,
+    depth: usize,
+}
+
+impl std::ops::Add for MctsBackprop {
+    type Output = MctsBackprop;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        MctsBackprop {
+            num_wins: self.num_wins + rhs.num_wins,
+            num_sims: self.num_sims + rhs.num_sims,
+            depth: self.depth.max(rhs.depth),
         }
-    }
-
-    pub fn state(&self) -> &S {
-        &self.root.state
-    }
-
-    pub fn size(&self) -> usize {
-        self.root.rollouts
-    }
-
-    pub fn iter(&mut self) {
-        self.root.iter(self.root_depth);
-        let now = Instant::now();
-        if now - self.last_print > PRINT_INTERVAL {
-            self.last_print = now;
-            print!(
-                "\x1b[G{:5}{:10}/{:10}  {:10.6}",
-                self.root_depth,
-                self.root.sente_wins,
-                self.root.rollouts,
-                self.root.sente_wins as f32 / self.root.rollouts as f32
-            );
-            std::io::stdout().flush().unwrap();
-        }
-    }
-
-    pub fn best(&self) -> Option<S::Move> {
-        self.root.best(self.root_depth)
-    }
-
-    pub fn into_move(mut self, mv: S::Move) -> Self {
-        self.root = self.root.into_move(mv);
-        self.root_depth += 1;
-        self
     }
 }
 
-impl<S: MctsState> MctsNode<S> {
-    fn new(state: S) -> MctsNode<S> {
-        if let Some(sente_win) = state.terminal() {
-            MctsNode {
-                state,
-                sente_wins: sente_win as usize,
-                rollouts: 1,
-                children: MctsChildren::Leaf(sente_win),
-            }
+impl<'a, S: MctsState> MctsNode<'a, S> {
+    fn new(action: usize, state: S) -> MctsNode<'a, S> {
+        let terminal = state.terminal();
+        let rollout = state.rollout();
+        let num_wins = rollout as u32;
+        let num_sims = 1;
+        MctsNode {
+            action,
+            state,
+            terminal,
+            num_wins,
+            num_sims,
+            children: None,
+        }
+    }
+
+    fn uct(&self, depth: usize, ln_n: f64) -> Finite {
+        let w = match depth % 2 == 0 {
+            true => self.num_sims - self.num_wins,
+            false => self.num_wins,
+        };
+        let n = self.num_sims as f64;
+        ((w as f64 / n) + (1.0 * ln_n / n).sqrt()).into()
+    }
+
+    fn descend(&mut self, bump: &'a Bump, depth: usize) -> MctsBackprop {
+        if let Some(sente_win) = self.terminal {
+            // terminal nodes expand immediately
+            return MctsBackprop {
+                num_wins: 100 * (sente_win as u32),
+                num_sims: 100,
+                depth: depth,
+            };
+        }
+
+        if let Some(ref mut children) = self.children {
+            // continue selection
+            let ln_n = (self.num_sims as f64).ln();
+            let child = children
+                .iter_mut()
+                .max_by_key(|n| n.uct(depth + 1, ln_n))
+                .expect("no child");
+            child.iter(bump, depth + 1)
         } else {
-            let sente_win = state.rollout();
-            MctsNode {
-                state,
-                sente_wins: sente_win as usize,
-                rollouts: 1,
-                children: MctsChildren::Unknown,
-            }
+            let it = self.state.children().map(|(i, s)| MctsNode::new(i, s));
+            let children = bump.alloc_slice_fill_iter(it);
+            let backprop = children
+                .iter()
+                .map(|c| MctsBackprop {
+                    num_wins: c.num_wins,
+                    num_sims: c.num_sims,
+                    depth: depth + 1,
+                })
+                .reduce(|a, b| a + b)
+                .expect("no child");
+            self.children = Some(children);
+            backprop
         }
     }
 
-    fn uct(&self, depth: usize, ln_n: f32, explore: f32) -> F32Ord {
-        let sente = depth % 2 == 0;
-        let wins = match sente {
-            true => self.sente_wins,
-            false => self.rollouts - self.sente_wins,
-        };
-        let n = self.rollouts as f32;
-        (wins as f32 / n + explore * (ln_n / n).sqrt()).into()
+    fn iter(&mut self, bump: &'a Bump, depth: usize) -> MctsBackprop {
+        let backprop = self.descend(bump, depth);
+        self.num_wins += backprop.num_wins;
+        self.num_sims += backprop.num_sims;
+        backprop
     }
 
-    fn iter(&mut self, depth: usize) {
-        match self.children {
-            MctsChildren::Unknown => {
-                let children = self
-                    .state
-                    .children()
-                    .map(|(m, s)| (m, MctsNode::new(s)))
-                    .collect();
-                self.children = MctsChildren::List(children);
-            }
-            MctsChildren::Leaf(sente_win) => {
-                self.sente_wins += sente_win as usize;
-                self.rollouts += 1;
-                return;
-            }
-            MctsChildren::List(ref mut children) => {
-                let ln_n = (self.rollouts as f32).ln();
-                let (_, child) = children
-                    .iter_mut()
-                    .max_by_key(|(_, c)| c.uct(depth, ln_n, EXPLORE))
-                    .expect("no children");
-                child.iter(depth + 1);
-            }
+    fn best(&self) -> S {
+        if let Some(_) = self.terminal {
+            panic!("node is terminal");
         }
-        let MctsChildren::List(ref children) = self.children else {
-            panic!("no children");
-        };
-        self.sente_wins = 0;
-        self.rollouts = 0;
-        for (_, child) in children.iter() {
-            self.sente_wins += child.sente_wins;
-            self.rollouts += child.rollouts;
+
+        self.children
+            .as_ref()
+            .expect("no children")
+            .iter()
+            .max_by_key(|c| c.num_sims)
+            .expect("no child")
+            .state
+            .clone()
+    }
+
+    fn best_leaf(&self) -> S {
+        if let Some(_) = self.terminal {
+            return self.state;
+        }
+
+        if let Some(ref children) = self.children {
+            children
+                .iter()
+                .max_by_key(|c| c.num_sims)
+                .expect("no child")
+                .best_leaf()
+        } else {
+            self.state
         }
     }
 
-    fn best(&self, depth: usize) -> Option<S::Move> {
-        let ln_n = (self.rollouts as f32).ln();
-        let children = match self.children {
-            MctsChildren::Unknown => panic!(),
-            MctsChildren::Leaf(_) => return None,
-            MctsChildren::List(ref children) => children,
-        };
-        let (mv, _) = children
-            .into_iter()
-            .max_by_key(|(_, c)| c.uct(depth, ln_n, 0.0))?;
-        Some(*mv)
+    fn policy(&self) -> Vec<f32> {
+        let mut policy = vec![0.0; S::max_move_count()];
+        for x in self.children.as_ref().unwrap().iter() {
+            policy[x.action] = x.num_sims as f32 / self.num_sims as f32;
+        }
+        policy
     }
 
-    fn into_move(self, mv: S::Move) -> Self {
-        match self.children {
-            MctsChildren::Unknown => {
-                let (_, child) = self
-                    .state
-                    .children()
-                    .find(|(m, _)| *m == mv)
-                    .expect("no move");
-                MctsNode::new(child)
-            }
-            MctsChildren::Leaf(_) => panic!(),
-            MctsChildren::List(children) => {
-                let (_, child) = children
-                    .into_iter()
-                    .find(|(m, _)| *m == mv)
-                    .expect("no move");
-                child
-            }
-        }
+    fn value(&self) -> f32 {
+        let x = self.num_wins as f32 / self.num_sims as f32;
+        x * 2.0 - 1.0
     }
 }
 
-#[derive(Copy, Clone, PartialOrd)]
-struct F32Ord(f32);
+pub struct MctsStats<S> {
+    pub num_wins: u32,
+    pub num_sims: u32,
+    pub min_depth: usize,
+    pub max_depth: usize,
+    pub allocated_bytes: usize,
+    pub best_state: S,
+    pub best_state_leaf: S,
+}
 
-impl From<f32> for F32Ord {
-    fn from(value: f32) -> Self {
-        assert!(value.is_finite());
-        Self(value)
+pub trait MctsMonitor<S> {
+    fn defer(&mut self, stats: &MctsStats<S>) -> ControlFlow<()>;
+}
+
+impl<S, F> MctsMonitor<S> for F
+where
+    F: FnMut(&MctsStats<S>) -> ControlFlow<()>,
+{
+    fn defer(&mut self, stats: &MctsStats<S>) -> ControlFlow<()> {
+        (self)(stats)
     }
 }
 
-impl PartialEq for F32Ord {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.partial_cmp(&other.0).unwrap() == Ordering::Equal
-    }
+pub struct Output<S> {
+    pub best: S,
+    pub policy: Vec<f32>,
+    pub value: f32,
 }
 
-impl Eq for F32Ord {}
+pub fn search<S: MctsState, M: MctsMonitor<S>>(
+    state: S,
+    depth: usize,
+    mut monitor: M,
+) -> Output<S> {
+    let bump = Bump::new();
+    let mut root = MctsNode::new(0, state);
+    let mut min_depth: usize = std::usize::MAX;
+    let mut max_depth: usize = 0;
 
-impl Ord for F32Ord {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap()
+    loop {
+        for _ in 0..100 {
+            let backprop = root.iter(&bump, depth);
+            let stat_depth = backprop.depth - depth;
+            min_depth = min_depth.min(stat_depth);
+            max_depth = max_depth.max(stat_depth);
+        }
+
+        let stats = MctsStats {
+            num_wins: root.num_wins,
+            num_sims: root.num_sims,
+            min_depth,
+            max_depth,
+            allocated_bytes: bump.allocated_bytes(),
+            best_state: root.best(),
+            best_state_leaf: root.best_leaf(),
+        };
+        match monitor.defer(&stats) {
+            ControlFlow::Continue(_) => {}
+            ControlFlow::Break(_) => break,
+        }
+        min_depth = std::usize::MAX;
+        max_depth = 0;
+    }
+
+    Output {
+        best: root.best(),
+        policy: root.policy(),
+        value: root.value(),
     }
 }
