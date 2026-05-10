@@ -16,6 +16,7 @@ pub struct Output {
     pub board_sample: Bitboard,
     pub board_best: Bitboard,
     pub policy: Vec<f32>,
+    pub values: Vec<f32>,
     pub value_sample: f32,
     pub value_best: f32,
 }
@@ -44,6 +45,18 @@ struct Backprop {
     value: f32,
 }
 
+impl Backprop {
+    fn new(value: f32) -> Backprop {
+        Backprop { value }
+    }
+
+    fn decay(self, f: f32) -> Backprop {
+        Backprop {
+            value: self.value * (1.0 - f),
+        }
+    }
+}
+
 enum Node {
     Leaf,
     Terminal(f32),
@@ -51,13 +64,19 @@ enum Node {
 }
 
 impl Node {
-    fn step<E: Evaluator>(&mut self, eval: &E, board: Bitboard, parent_value: f32) -> Backprop {
+    fn step<E: Evaluator>(
+        &mut self,
+        eval: &E,
+        value_decay: f32,
+        board: Bitboard,
+        parent_value: f32,
+    ) -> Backprop {
         match self {
             Node::Leaf => {
                 if let Some(sente) = board.win() {
                     let value = if sente { 1.0 } else { -1.0 };
                     *self = Node::Terminal(value);
-                    Backprop { value }
+                    Backprop::new(value)
                 } else {
                     let res = eval.call(board);
                     let policy_denom_valid = res
@@ -73,7 +92,7 @@ impl Node {
                         .map(|i| Edge::new(i, res.policy[i] / policy_denom_valid))
                         .collect::<Vec<_>>();
                     *self = Node::Edges(edges);
-                    Backprop { value: res.value }
+                    Backprop::new(res.value)
                 }
             }
             Node::Terminal(value) => Backprop { value: *value },
@@ -86,7 +105,7 @@ impl Node {
                     .argmax()
                     .expect("no edges");
                 let e = &mut edges[puct_select];
-                e.step(eval, board)
+                e.step(eval, value_decay, board)
             }
         }
     }
@@ -120,21 +139,22 @@ impl Edge {
         (puct as f64).into()
     }
 
-    fn step<E: Evaluator>(&mut self, eval: &E, board: Bitboard) -> Backprop {
-        let backprop = self
-            .child
-            .step(eval, board.nth_child(self.action), self.mean_value);
+    fn step<E: Evaluator>(&mut self, eval: &E, value_decay: f32, board: Bitboard) -> Backprop {
+        let backprop =
+            self.child
+                .step(eval, value_decay, board.nth_child(self.action), self.mean_value);
 
         self.visits += 1;
         self.total_value += backprop.value;
         self.mean_value = self.total_value / self.visits as f32;
 
-        backprop
+        backprop.decay(value_decay)
     }
 }
 
 struct Tree {
     dirichlet: f32,
+    value_decay: f32,
     root_board: Bitboard,
     root_visits: usize,
     root_total_value: f32,
@@ -143,9 +163,10 @@ struct Tree {
 }
 
 impl Tree {
-    fn new(board: Bitboard, dirichlet: f32) -> Tree {
+    fn new(board: Bitboard, dirichlet: f32, value_decay: f32) -> Tree {
         Tree {
             dirichlet,
+            value_decay,
             root_board: board,
             root_visits: 0,
             root_total_value: 0.0,
@@ -155,7 +176,9 @@ impl Tree {
     }
 
     fn step<E: Evaluator>(&mut self, eval: &E) {
-        let backprop = self.root.step(eval, self.root_board, self.root_mean_value);
+        let backprop =
+            self.root
+                .step(eval, self.value_decay, self.root_board, self.root_mean_value);
 
         if self.root_visits == 0
             && self.dirichlet > 0.0
@@ -201,6 +224,17 @@ impl Tree {
             .map(|e| e.mean_value)
             .unwrap_or(0.0)
     }
+
+    fn values(&self) -> Vec<f32> {
+        let mut values: Vec<f32> = vec![f32::NAN; BOARD_SIZE];
+        let Node::Edges(ref edges) = self.root else {
+            panic!("root has no children");
+        };
+        for edge in edges.iter() {
+            values[edge.action] = edge.mean_value;
+        }
+        values
+    }
 }
 
 pub fn search<B: Backend, M: Monitor>(
@@ -208,19 +242,21 @@ pub fn search<B: Backend, M: Monitor>(
     device: &B::Device,
     board: Bitboard,
     dirichlet: f32,
+    value_decay: f32,
     mon: M,
 ) -> Output {
     let eval = ModelEvaluator { model, device };
-    search_with_evaluator(&eval, board, dirichlet, mon)
+    search_with_evaluator(&eval, board, dirichlet, value_decay, mon)
 }
 
 pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
     eval: &E,
     board: Bitboard,
     dirichlet: f32,
+    value_decay: f32,
     mon: M,
 ) -> Output {
-    let mut tree = Tree::new(board, dirichlet);
+    let mut tree = Tree::new(board, dirichlet, value_decay);
     for _ in 0.. {
         tree.step(eval);
         let stats = Stats {
@@ -246,6 +282,7 @@ pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
         board_sample: board.nth_child(sample),
         board_best: board.nth_child(best),
         policy,
+        values: tree.values(),
         value_sample: tree.value(sample),
         value_best: tree.value(best),
     }

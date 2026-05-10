@@ -89,7 +89,8 @@ impl Positions {
             return Err(io::Error::other("positions size be a multiple of SERIALIZED_LEN"));
         }
         self.count += len / SERIALIZED_LEN;
-        self.file.write_all(data)
+        self.file.write_all(data)?;
+        self.file.flush()
     }
 
     pub fn read_serialized_range(

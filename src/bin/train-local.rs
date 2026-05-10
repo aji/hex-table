@@ -253,7 +253,7 @@ fn self_play(idx: usize, ctx: Context) {
             let limit = 600 + idx;
             let eval = BatchEvaluator(&ctx);
             let out =
-                search_with_evaluator(&eval, board, SELF_PLAY_DIRICHLET, |n: usize| n < limit);
+                search_with_evaluator(&eval, board, SELF_PLAY_DIRICHLET, 0.0, |n: usize| n < limit);
             let (board, value) = if depth < SELF_PLAY_SAMPLE_THRESHOLD {
                 (out.board_sample, out.value_sample)
             } else {

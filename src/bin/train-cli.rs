@@ -4,11 +4,18 @@ use clap::{Parser, Subcommand};
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
     nn::{
-        model::ModelConfig,
+        model::{EvalRequest, ModelConfig},
         search::search,
-        train::{controller::ControllerClient, error::TrainError},
+        train::{
+            controller::ControllerClient,
+            error::TrainError,
+            positions::{Position, SERIALIZED_LEN},
+        },
+        transform::Transpose,
     },
+    util::{Finite, IteratorExt},
 };
+use rand::SeedableRng;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -31,9 +38,28 @@ enum Commands {
         #[arg(long, value_name = "ID")]
         model: String,
 
-        /// The number of iters per search
+        /// The number of iters per search. Set to 0 for no search at all
         #[arg(long, value_name = "N", default_value = "1600")]
         iters: usize,
+
+        /// The value decay parameter to use
+        #[arg(long, value_name = "F", default_value = "0.0")]
+        value_decay: f32,
+
+        /// The sampling temperature to use
+        #[arg(long, value_name = "F")]
+        temperature: Option<f32>,
+    },
+
+    /// Fetch and display recent position buffer items
+    Positions {
+        /// The model ID to use
+        #[arg(long, value_name = "ID")]
+        model: String,
+
+        /// The number of recent positions to fetch
+        #[arg(long, value_name = "N", default_value = "1")]
+        count: usize,
     },
 
     /// Create a new model
@@ -93,7 +119,45 @@ fn main() {
                 .unwrap_or_else(TrainError::unrecoverable);
         }
 
-        Commands::Play { model, iters } => {
+        Commands::Positions { model, count } => {
+            let (_, data) = client
+                .fetch_positions(&model, Some(-(count as isize)))
+                .unwrap_or_else(TrainError::unrecoverable);
+            let n = data.len() / SERIALIZED_LEN;
+            for i in 0..n {
+                let i0 = i * SERIALIZED_LEN;
+                let i1 = (i + 1) * SERIALIZED_LEN;
+                let mut pos = Position::deserialize_from(&data[i0..i1]);
+                if i % 2 != 0 {
+                    pos.apply_transform(&Transpose);
+                }
+                for r in 0..11 {
+                    for _ in 0..r {
+                        print!(" ");
+                    }
+                    print!("\\");
+                    for c in 0..11 {
+                        let policy = pos.policy[r * 11 + c];
+                        let color = (policy.powf(0.5) * (255.0 - 232.0) + 232.0).round() as usize;
+                        let num = format!("{:02}", (policy * 99.0).round() as usize);
+                        let circle = "○ ";
+                        match pos.board.rc(r, c) {
+                            Some(true) => print!("\x1b[31m\x1b[48;5;232m{circle}\x1b[0m"),
+                            Some(false) => print!("\x1b[36m\x1b[48;5;232m{circle}\x1b[0m"),
+                            None => print!("\x1b[48;5;232;38;5;{color}m{num}\x1b[0m"),
+                        }
+                    }
+                    println!("\\");
+                }
+            }
+        }
+
+        Commands::Play {
+            model,
+            iters,
+            value_decay,
+            temperature,
+        } => {
             let config = client
                 .fetch_config(&model)
                 .unwrap_or_else(TrainError::unrecoverable);
@@ -102,12 +166,18 @@ fn main() {
                 .unwrap_or_else(TrainError::unrecoverable)
                 .into_data()
                 .expect("fetch without etag should return data");
-            play(config, data, iters);
+            play(config, data, iters, value_decay, temperature);
         }
     }
 }
 
-fn play(config: ModelConfig, data: Vec<u8>, iters: usize) {
+fn play(
+    config: ModelConfig,
+    data: Vec<u8>,
+    iters: usize,
+    value_decay: f32,
+    temperature: Option<f32>,
+) {
     type B = burn::backend::Wgpu<f32, i32>;
     let device = Default::default();
     let model = config.init::<B>(&device);
@@ -115,20 +185,47 @@ fn play(config: ModelConfig, data: Vec<u8>, iters: usize) {
 
     let start = Instant::now();
     let mut board = Bitboard::new();
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(12345);
     loop {
         if let Some(win) = board.win() {
             println!("({:?})\n{}", start.elapsed(), BitboardPretty(&board));
             println!("({:?}) {} wins", start.elapsed(), if win { "sente" } else { "gote" });
             return;
         }
-        println!("({:?})\n{}", start.elapsed(), BitboardPretty(&board));
-        let out = search(&model, &device, board, 0.0, |n: usize| {
-            print!("\x1b[G\x1b[K{n}/{iters} {:.1}%", n as f64 * 100.0 / iters as f64);
-            std::io::stdout().flush().ok();
-            n < iters
-        });
-        println!();
-        board = out.board_best;
-        println!("({:?}) value={}", start.elapsed(), out.value_best);
+        if iters > 0 {
+            println!("({:?})\n{}", start.elapsed(), BitboardPretty(&board));
+            let out = search(&model, &device, board, 0.0, value_decay, |n: usize| {
+                print!("\x1b[G\x1b[K{n}/{iters} {:.1}%", n as f64 * 100.0 / iters as f64);
+                std::io::stdout().flush().ok();
+                n < iters
+            });
+            println!();
+            if let Some(temp) = temperature {
+                let m = out
+                    .policy
+                    .iter()
+                    .map(|x| x.powf(1.0 / temp))
+                    .sample_weighted(&mut rand::rng())
+                    .expect("policy should not be empty");
+                board = board.nth_child(m);
+                println!("({:?}) value={}", start.elapsed(), out.values[m]);
+            } else {
+                board = out.board_best;
+                println!("({:?}) value={}", start.elapsed(), out.value_best);
+            }
+        } else {
+            let out = model.eval_one(EvalRequest::new(board), &device);
+            let policy = out
+                .policy
+                .iter()
+                .enumerate()
+                .map(|(i, x)| if board.nth_child_valid(i) { *x } else { 0.0 });
+            let m = if let Some(temp) = temperature {
+                policy.map(|x| x.powf(1.0 / temp)).sample_weighted(&mut rng)
+            } else {
+                policy.map(Finite::from).argmax()
+            };
+            board = board.nth_child(m.expect("no children"));
+        }
     }
 }

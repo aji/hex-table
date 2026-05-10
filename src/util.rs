@@ -56,6 +56,12 @@ impl From<f64> for Finite {
     }
 }
 
+impl From<f32> for Finite {
+    fn from(value: f32) -> Self {
+        Self::from(value as f64)
+    }
+}
+
 impl Eq for Finite {}
 
 impl Ord for Finite {

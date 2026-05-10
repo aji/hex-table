@@ -14,9 +14,10 @@ pub fn main() {
             if board.win().is_some() {
                 break;
             }
-            let out = nn::search::search_with_evaluator(&MctsEval, board, 0.0, |iters: usize| {
-                iters < 1200
-            });
+            let out =
+                nn::search::search_with_evaluator(&MctsEval, board, 0.0, 0.0, |iters: usize| {
+                    iters < 1200
+                });
             board = out.board_best;
         }
         println!("GAME OVER\n\n\n");

@@ -257,7 +257,7 @@ fn self_play(_idx: usize, cf: AppConfig) {
         let mut board = Bitboard::new();
         let mut log: Vec<(Bitboard, [f32; 121])> = Vec::new();
         while board.win().is_none() {
-            let out = search_with_evaluator(&cf, board, 0.25, monitor);
+            let out = search_with_evaluator(&cf, board, 0.25, 0.0, monitor);
             cf.total_moves.fetch_add(1, Ordering::Relaxed);
             log.push((board, out.policy.try_into().unwrap()));
             board = if log.len() < 30 { out.board_sample } else { out.board_best };
