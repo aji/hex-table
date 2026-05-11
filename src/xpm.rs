@@ -71,7 +71,7 @@ impl fmt::Display for XpmImage {
 // The vertical spacing between hexes is 4s. The offset for hexes in adjacent
 // columns is 2s. The horizontal spacing between columns is 3s+3
 
-const PALETTE: [(u8, u8, u8); 4] = [(28, 28, 28), (64, 64, 64), (237, 0, 76), (0, 153, 234)];
+const PALETTE: [(u8, u8, u8); 4] = [(0, 0, 0), (64, 64, 64), (237, 0, 76), (0, 153, 234)];
 
 const C_DARK_GREY: u8 = 1;
 const C_RED: u8 = 2;
@@ -117,6 +117,32 @@ pub fn render_board(board: Bitboard, scale: usize) -> XpmImage {
             render_hex(&mut img, scale, x, y, fill, Some(C_DARK_GREY));
         }
     }
+    for i in 0..11 {
+        // bottom left edge
+        let x = (x0 + i * dx_dr).cast_unsigned();
+        let y = (y0 + i * dy_dr).cast_unsigned();
+        render_hex_edge(&mut img, scale, x - 1, y + 2, 3, C_RED);
+        render_hex_edge(&mut img, scale, x - 1, y + 2, 4, C_RED);
+
+        // top right edge
+        let x = (x0 + i * dx_dr + 10 * dx_dc).cast_unsigned();
+        let y = (y0 + i * dy_dr + 10 * dy_dc).cast_unsigned();
+        render_hex_edge(&mut img, scale, x + 1, y - 2, 2, C_RED);
+        render_hex_edge(&mut img, scale, x + 1, y - 2, 1, C_RED);
+    }
+    for i in 0..11 {
+        // top left edge
+        let x = (x0 + i * dx_dc).cast_unsigned();
+        let y = (y0 + i * dy_dc).cast_unsigned();
+        render_hex_edge(&mut img, scale, x - 1, y - 2, 0, C_BLUE);
+        render_hex_edge(&mut img, scale, x - 1, y - 2, 1, C_BLUE);
+
+        // bottom right edge
+        let x = (x0 + i * dx_dc + 10 * dx_dr).cast_unsigned();
+        let y = (y0 + i * dy_dc + 10 * dy_dr).cast_unsigned();
+        render_hex_edge(&mut img, scale, x + 1, y + 2, 5, C_BLUE);
+        render_hex_edge(&mut img, scale, x + 1, y + 2, 4, C_BLUE);
+    }
     img
 }
 
@@ -145,5 +171,28 @@ fn render_hex(
     for r in 0..rows {
         row(r, r);
         row(r + rows - 1, rows - r - 1);
+    }
+}
+
+/// Render the nth edge of the hex at (x, y) where (x, y) is the top left of its bounding box
+fn render_hex_edge(im: &mut XpmImage, scale: usize, x: usize, y: usize, n: usize, stroke: u8) {
+    let rows = 2 * scale;
+
+    let mut row = |r, r0, n0: usize| {
+        let dx = r0 / 2;
+        let c0 = scale - 1 - dx;
+        let c1 = 3 * scale + 1 + dx;
+        for c in c0..=c1 {
+            let isc0 = c == c0 && n == n0 + 0;
+            let isc1 = c == c1 && n == n0 + 2;
+            let isr0 = r0 == 0 && n == n0 + 1;
+            let color = (isc0 || isc1 || isr0).then_some(stroke);
+            color.iter().for_each(|color| im.put(x + c, y + r, *color));
+        }
+    };
+
+    for r in 0..rows {
+        row(r, r, 0);
+        row(r + rows - 1, rows - r - 1, 3);
     }
 }

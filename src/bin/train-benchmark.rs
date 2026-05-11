@@ -1,8 +1,9 @@
 use std::{
     f64::consts::PI,
+    fs::File,
     io::{self, Write},
     ops::ControlFlow,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -164,9 +165,25 @@ struct RankCommand {
     #[arg(long, value_name = "FILE")]
     checkpoint: Option<PathBuf>,
 
+    /// Rank all checkpoints and write their ranks to the given CSV
+    #[arg(long, value_name = "FILE")]
+    rank_all: Option<PathBuf>,
+
     /// Stop at the given stddev cutoff
-    #[arg(long, value_name = "X", default_value = "0.1")]
-    stddev_stop: f64,
+    #[arg(long, value_name = "X")]
+    stddev_stop: Option<f64>,
+
+    /// Stop at the given number of iterations
+    #[arg(long, value_name = "N")]
+    iters_stop: Option<usize>,
+
+    /// Minimum rank. Defaults to 1
+    #[arg(long, value_name = "N", default_value = "1.0")]
+    rank_min: f64,
+
+    /// Maximum rank. Defaults to 8
+    #[arg(long, value_name = "N", default_value = "8.0")]
+    rank_max: f64,
 }
 
 fn cmd_rank<B: Backend>(
@@ -176,49 +193,104 @@ fn cmd_rank<B: Backend>(
     model: Model<B>,
     device: B::Device,
 ) -> io::Result<()> {
-    // rank of 9 corresponds to 1e9 rollouts
-    const RANK_MAX: usize = 9;
-    const RANK_SUBUNITS: usize = 100;
-
-    // this is roughly calibrated to the skill.ipynb analysis
-    const RANK_SCALE: f64 = 2.0;
-
     let nn_evals_per_time = bench_model_evals(&model, &device, true);
     let mcts_evals_per_time = bench_mcts_evals(true);
     let compute_equiv_rank =
         ((mcts_evals_per_time / nn_evals_per_time).log10() * 100.0).round() / 100.0;
     assert!(compute_equiv_rank > 0.0);
 
-    let ranks_n = RANK_MAX * RANK_SUBUNITS + 1;
-    let ranks_xs = Linspace::new(0.0, RANK_MAX as f64, ranks_n);
-    let mut ranks = Prior::from_fn(ranks_xs, |x| {
-        let uniform = 1.0 / ranks_n as f64;
-        let normal = x.normal(compute_equiv_rank, 3.0);
-        0.25.lerp(uniform, normal)
-    });
-
-    let model = {
-        let checkpoint = if let Some(ref path) = cmd.checkpoint {
-            path.clone()
-        } else {
-            let checkpoint = checkpoints
-                .into_iter()
-                .last()
-                .ok_or_else(|| io::Error::other("no checkpoints"))?;
-            cli.model_dir.join(checkpoint)
-        };
-
-        log::info!("loading {}", checkpoint.display());
-        let bytes = std::fs::read(checkpoint)?;
-        model.load_bytes(bytes, &device)
+    let mut rank_one = RankOne {
+        model: &model,
+        device: &device,
+        compute_equiv_rank,
+        stddev_stop: cmd.stddev_stop,
+        iters_stop: cmd.iters_stop,
+        rank_min: Some(cmd.rank_min),
+        rank_max: Some(cmd.rank_max),
     };
 
-    let mut model_player = ModelPlayer::new(&model, &device);
+    if rank_one.iters_stop.is_none() && rank_one.stddev_stop.is_none() {
+        log::warn!("using default stopping condition of 40 iters");
+        rank_one.iters_stop = Some(40);
+    }
+
+    if let Some(ref path) = cmd.rank_all {
+        let mut out = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)?;
+        writeln!(
+            out,
+            "{},{},{},{},{},{},{}",
+            "checkpoint",
+            "rank",
+            "compute_equiv_rank",
+            "mean",
+            "stddev",
+            "iters",
+            "elapsed_seconds"
+        )?;
+        out.flush().ok();
+        for checkpoint in checkpoints {
+            let path = cli.model_dir.join(checkpoint);
+            cmd_rank_one(Some(&mut out), &path, &rank_one)?;
+        }
+    } else if let Some(ref path) = cmd.checkpoint {
+        cmd_rank_one(None, path, &rank_one)?;
+    } else {
+        let checkpoint = checkpoints
+            .into_iter()
+            .last()
+            .ok_or_else(|| io::Error::other("no checkpoints"))?;
+        let path = cli.model_dir.join(checkpoint);
+        cmd_rank_one(None, &path, &rank_one)?;
+    };
+
+    Ok(())
+}
+
+struct RankOne<'a, B: Backend> {
+    model: &'a Model<B>,
+    device: &'a B::Device,
+    compute_equiv_rank: f64,
+    stddev_stop: Option<f64>,
+    iters_stop: Option<usize>,
+    rank_min: Option<f64>,
+    rank_max: Option<f64>,
+}
+
+fn cmd_rank_one<'a, B: Backend>(
+    out: Option<&mut File>,
+    checkpoint: &Path,
+    cmd: &'a RankOne<'a, B>,
+) -> io::Result<()> {
+    const RANK_SUBUNITS: f64 = 128.0;
+
+    let rank_min = cmd.rank_min.unwrap_or(1.0);
+    let rank_max = cmd.rank_max.unwrap_or(8.0);
+
+    let ranks_n = ((rank_max - rank_min) * RANK_SUBUNITS + 1.0).round() as usize;
+    let ranks_xs = Linspace::new(rank_min as f64, rank_max as f64, ranks_n);
+    let mut ranks = Prior::from_fn(ranks_xs, |x| {
+        let uniform = 1.0 / ranks_n as f64;
+        let normal = x.normal(cmd.compute_equiv_rank, 1.0);
+        0.75.lerp(normal, uniform)
+    });
+
+    let start = Instant::now();
+    let model = {
+        log::info!("loading {}", checkpoint.display());
+        let bytes = std::fs::read(checkpoint)?;
+        cmd.model.clone().load_bytes(bytes, cmd.device)
+    };
+
+    let mut model_player = ModelPlayer::new(&model, &cmd.device);
     for iter in 0usize.. {
         let rank = ranks.argmax();
         let stats = ranks.stats();
 
-        let handicap = rank - compute_equiv_rank;
+        let handicap = rank - cmd.compute_equiv_rank;
         let stddev = stats.variance.sqrt();
         let strength = 10.0f64.powf(rank) as u32;
 
@@ -231,23 +303,44 @@ fn cmd_rank<B: Backend>(
             handicap,
         );
 
-        if stddev <= cmd.stddev_stop {
+        let iters_stop = cmd.iters_stop.map(|x| x <= iter).unwrap_or(false);
+        let stddev_stop = cmd.stddev_stop.map(|x| stddev <= x).unwrap_or(false);
+        if iters_stop || stddev_stop {
+            let rank = ranks.argmax();
+            let handicap = rank - cmd.compute_equiv_rank;
             let lo = 10.0f64.powf(handicap - stddev * 2.0);
             let hi = 10.0f64.powf(handicap + stddev * 2.0);
-            log::info!(
-                "hit stddev threshold. model is {lo:.1}x-{hi:.1}x as fast as mcts (95% confidence)",
-            );
+            log::info!("model seems {lo:.1}x-{hi:.1}x as fast as mcts",);
+            if let Some(out) = out {
+                writeln!(
+                    out,
+                    "{},{:.2},{:.2},{:.5},{:.5},{},{}",
+                    checkpoint.file_name().unwrap().display(),
+                    rank,
+                    cmd.compute_equiv_rank,
+                    stats.mean,
+                    stddev,
+                    iter,
+                    start.elapsed().as_secs_f64()
+                )?;
+                out.flush().ok();
+            }
             break;
         }
 
         let mut mcts_player = MctsPlayer::new(strength);
-        let model_win = match iter.is_multiple_of(2) {
+        let model_is_sente = iter.is_multiple_of(2);
+        let sente_win = match model_is_sente {
             true => play(&mut model_player, &mut mcts_player),
-            false => !play(&mut mcts_player, &mut model_player),
+            false => play(&mut mcts_player, &mut model_player),
         };
         ranks.update(|x| {
-            let p = ((x - rank) * RANK_SCALE).sigmoid();
-            match model_win {
+            let sente_relative_rank = match model_is_sente {
+                true => x - rank,
+                false => rank - x,
+            };
+            let p = p_sente_win(sente_relative_rank);
+            match sente_win {
                 true => p,
                 false => 1.0 - p,
             }
@@ -255,6 +348,11 @@ fn cmd_rank<B: Backend>(
     }
 
     Ok(())
+}
+
+fn p_sente_win(sente_relative_rank: f64) -> f64 {
+    // This is roughly calibrated to the logistic regression in skill.ipynb
+    (0.3 + 1.8 * sente_relative_rank).sigmoid()
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -381,6 +479,16 @@ impl Prior {
 
     fn argmax(&self) -> f64 {
         let i = self.iter().argmax().unwrap();
+        self.xs.nth(i)
+    }
+
+    fn sample(&self) -> f64 {
+        let i = self
+            .ys
+            .iter()
+            .copied()
+            .sample_weighted(&mut rand::rng())
+            .unwrap();
         self.xs.nth(i)
     }
 
