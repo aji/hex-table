@@ -49,6 +49,12 @@ impl fmt::Display for SizePretty {
 #[derive(Copy, Clone, PartialOrd, PartialEq)]
 pub struct Finite(f64);
 
+impl Finite {
+    pub fn into_inner(self) -> f64 {
+        self.0
+    }
+}
+
 impl From<f64> for Finite {
     fn from(value: f64) -> Self {
         debug_assert!(value.is_finite());
