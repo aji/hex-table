@@ -2,23 +2,22 @@ use std::{
     io::Write,
     ops::ControlFlow,
     sync::{Arc, Mutex},
-    time::Instant,
 };
 
 use rayon::prelude::*;
 
 use hex_table::{
-    bb::{Bitboard, BitboardPretty},
+    bb::Bitboard,
     mcts::{self, MctsStats},
 };
 
 fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
     let mut board = Bitboard::new();
-    println!("\n\nSTART: {black_rollouts} VS {white_rollouts}\n");
+    // println!("\n\nSTART: {black_rollouts} VS {white_rollouts}\n");
     for turn in 0.. {
-        println!("\n{}", BitboardPretty(&board));
+        // println!("\n{}", BitboardPretty(&board));
         if let Some(win) = board.win() {
-            println!("{} wins", if win { "black" } else { "white" });
+            // println!("{} wins", if win { "black" } else { "white" });
             return win;
         }
         let max_sims = match turn % 2 == 0 {
@@ -36,43 +35,8 @@ fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
     unreachable!()
 }
 
-#[allow(unused)]
-fn one_turn(game: Bitboard, depth: usize) -> Bitboard {
-    let start_search = Instant::now();
-    let init_state = game;
-    let out = mcts::search(init_state, depth, |stats: &MctsStats<Bitboard>| {
-        let elapsed = start_search.elapsed();
-        print!("\x1b[H\x1b[J");
-        println!("{}", BitboardPretty(&init_state));
-        let mv = Bitboard {
-            black: !init_state.black & stats.best_state.black,
-            white: !init_state.white & stats.best_state.white,
-        };
-        println!("{}", BitboardPretty(&mv));
-        println!("{}", BitboardPretty(&stats.best_state));
-        println!("{}", BitboardPretty(&stats.best_state_leaf));
-        print!(
-            "{:>10} {:5.3} d={:2}..{:2} {:>9}({:>4}/sim) {:>7.1?}({:4?}/sim)",
-            util::NumPretty(stats.num_sims as usize),
-            stats.num_wins as f32 / stats.num_sims as f32,
-            stats.min_depth,
-            stats.max_depth,
-            util::SizePretty(stats.allocated_bytes),
-            util::SizePretty(stats.allocated_bytes / stats.num_sims as usize),
-            elapsed,
-            elapsed / stats.num_sims
-        );
-        std::io::stdout().flush().unwrap();
-        match elapsed.as_secs() >= 1 {
-            true => ControlFlow::Break(()),
-            false => ControlFlow::Continue(()),
-        }
-    });
-    out.best
-}
-
 const CSV: &'static str = "notebooks/mcts2.txt";
-const GAMES: usize = 400;
+const GAMES: usize = 1000;
 
 fn main() {
     let f = Arc::new(Mutex::new(
@@ -84,8 +48,10 @@ fn main() {
             .unwrap(),
     ));
     write!(f.lock().unwrap(), "{},{},{}\n", "black_rollouts", "white_rollouts", "result").unwrap();
+    let pbar = Arc::new(Mutex::new(tqdm::pbar(Some(GAMES))));
     (0..GAMES).into_par_iter().for_each({
         let f = f.clone();
+        let pbar = pbar.clone();
         move |_| {
             let black_rollouts = 121.0f64.powf(rand::random_range(2.0..=3.5)) as u32;
             let white_rollouts = 121.0f64.powf(rand::random_range(2.0..=3.5)) as u32;
@@ -98,8 +64,10 @@ fn main() {
                 result as usize
             )
             .unwrap();
+            pbar.lock().unwrap().update(1).ok();
         }
     });
+    pbar.lock().unwrap().close().ok();
 }
 
 #[allow(unused)]
