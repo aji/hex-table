@@ -8,20 +8,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use burn::tensor::backend::Backend;
 use clap::{Parser, Subcommand};
 use hex_table::{
     bb::Bitboard,
     mcts::{self, MctsMonitor, MctsStats},
     nn::{
-        burn::model::BurnModel,
-        model::{EvalRequest, Model, ModelConfig},
+        candle::model::{CandleDevice, CandleModel},
+        search::Evaluator,
     },
     util::{Finite, IteratorExt},
 };
 use tqdm::Iter;
-
-type Wgpu = burn::backend::Wgpu<f32, i32>;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -45,11 +42,8 @@ fn main() -> io::Result<()> {
     let cli = Cli::parse();
     log::info!("got options: {cli:?}");
 
-    let device = Default::default();
-    let config =
-        ModelConfig::load(cli.model_dir.join("config.json")).expect("could not load model config");
-    log::info!("loaded model config: {config:?}");
-    let model: BurnModel<Wgpu> = config.init(&device);
+    let device = CandleDevice::default();
+    log::info!("device: {device:?}");
 
     let checkpoints = {
         let mut checkpoints = std::fs::read_dir(&cli.model_dir)
@@ -64,9 +58,14 @@ fn main() -> io::Result<()> {
     log::info!("found {} checkpoints", checkpoints.len());
 
     match cli.command {
-        Commands::Compare(ref cmd) => cmd_compare(&cli, cmd, checkpoints, model, device),
-        Commands::Rank(ref cmd) => cmd_rank(&cli, cmd, checkpoints, model, device),
+        Commands::Compare(ref cmd) => cmd_compare(&cli, cmd, checkpoints, &device),
+        Commands::Rank(ref cmd) => cmd_rank(&cli, cmd, checkpoints, &device),
     }
+}
+
+fn load_checkpoint(path: &Path, device: &CandleDevice) -> io::Result<CandleModel> {
+    let bytes = std::fs::read(path)?;
+    CandleModel::load_burn(&bytes, device).map_err(io::Error::other)
 }
 
 /// Compare model checkpoints to an MCTS benchmark player
@@ -89,12 +88,11 @@ struct CompareCommand {
     mcts_handicap: f64,
 }
 
-fn cmd_compare<B: Backend>(
+fn cmd_compare(
     cli: &Cli,
     cmd: &CompareCommand,
     mut checkpoints: Vec<String>,
-    mut model: BurnModel<B>,
-    device: B::Device,
+    device: &CandleDevice,
 ) -> io::Result<()> {
     if let Some(n) = cmd.checkpoints
         && n < checkpoints.len()
@@ -103,7 +101,11 @@ fn cmd_compare<B: Backend>(
         let _ = checkpoints.drain(..checkpoints.len() - n);
     }
 
-    let nn_evals_per_time = bench_model_evals(&model, &device, false);
+    let first = checkpoints.first().ok_or_else(|| io::Error::other("no checkpoints"))?;
+    let nn_evals_per_time = {
+        let model = load_checkpoint(&cli.model_dir.join(first), device)?;
+        bench_model_evals(&model, false)
+    };
     let mcts_evals_per_time = bench_mcts_evals(false);
 
     let mcts_per_nn_base = (mcts_evals_per_time / nn_evals_per_time).round() as u32;
@@ -140,10 +142,9 @@ fn cmd_compare<B: Backend>(
         );
     }
     for checkpoint in checkpoints.iter().tqdm() {
-        let bytes = std::fs::read(cli.model_dir.join(checkpoint))?;
-        model = model.load_bytes(bytes, &device);
+        let model = load_checkpoint(&cli.model_dir.join(checkpoint), device)?;
         let (win_rate, wins_as_sente, wins_as_gote) =
-            make_them_fight(&model, &device, cmd.games, mcts_per_nn);
+            make_them_fight(&model, cmd.games, mcts_per_nn);
         writeln!(
             out,
             "{},{},{},{},{},{},{}",
@@ -189,22 +190,24 @@ struct RankCommand {
     rank_max: f64,
 }
 
-fn cmd_rank<B: Backend>(
+fn cmd_rank(
     cli: &Cli,
     cmd: &RankCommand,
     checkpoints: Vec<String>,
-    model: BurnModel<B>,
-    device: B::Device,
+    device: &CandleDevice,
 ) -> io::Result<()> {
-    let nn_evals_per_time = bench_model_evals(&model, &device, true);
+    let first = checkpoints.first().ok_or_else(|| io::Error::other("no checkpoints"))?;
+    let nn_evals_per_time = {
+        let model = load_checkpoint(&cli.model_dir.join(first), device)?;
+        bench_model_evals(&model, true)
+    };
     let mcts_evals_per_time = bench_mcts_evals(true);
     let compute_equiv_rank =
         ((mcts_evals_per_time / nn_evals_per_time).log10() * 100.0).round() / 100.0;
     assert!(compute_equiv_rank > 0.0);
 
     let mut rank_one = RankOne {
-        model: &model,
-        device: &device,
+        device,
         compute_equiv_rank,
         stddev_stop: cmd.stddev_stop,
         iters_stop: cmd.iters_stop,
@@ -253,9 +256,8 @@ fn cmd_rank<B: Backend>(
     Ok(())
 }
 
-struct RankOne<'a, B: Backend> {
-    model: &'a BurnModel<B>,
-    device: &'a B::Device,
+struct RankOne<'a> {
+    device: &'a CandleDevice,
     compute_equiv_rank: f64,
     stddev_stop: Option<f64>,
     iters_stop: Option<usize>,
@@ -263,10 +265,10 @@ struct RankOne<'a, B: Backend> {
     rank_max: Option<f64>,
 }
 
-fn cmd_rank_one<'a, B: Backend>(
+fn cmd_rank_one<'a>(
     out: Option<&mut File>,
     checkpoint: &Path,
-    cmd: &'a RankOne<'a, B>,
+    cmd: &'a RankOne<'a>,
 ) -> io::Result<()> {
     const RANK_SUBUNITS: f64 = 128.0;
 
@@ -282,13 +284,10 @@ fn cmd_rank_one<'a, B: Backend>(
     });
 
     let start = Instant::now();
-    let model = {
-        log::info!("loading {}", checkpoint.display());
-        let bytes = std::fs::read(checkpoint)?;
-        cmd.model.clone().load_bytes(bytes, cmd.device)
-    };
+    log::info!("loading {}", checkpoint.display());
+    let model = load_checkpoint(checkpoint, cmd.device)?;
 
-    let mut model_player = ModelPlayer::new(&model, &cmd.device);
+    let mut model_player = ModelPlayer::new(&model);
     for iter in 0usize.. {
         let rank = ranks.argmax();
         let stats = ranks.stats();
@@ -518,7 +517,7 @@ impl<S> MctsMonitor<S> for MctsSims {
     }
 }
 
-fn bench_model_evals<B: Backend>(model: &BurnModel<B>, device: &B::Device, fast: bool) -> f64 {
+fn bench_model_evals(model: &CandleModel, fast: bool) -> f64 {
     let board = Bitboard::new();
 
     log::info!("benchmarking model evals");
@@ -530,7 +529,7 @@ fn bench_model_evals<B: Backend>(model: &BurnModel<B>, device: &B::Device, fast:
     log::info!("warming up for {dur:?}");
     let start = Instant::now();
     while start.elapsed() < dur {
-        std::hint::black_box(model.eval_one(EvalRequest::new(board), device));
+        std::hint::black_box(model.call(board));
     }
 
     let dur = match fast {
@@ -541,7 +540,7 @@ fn bench_model_evals<B: Backend>(model: &BurnModel<B>, device: &B::Device, fast:
     let mut count = 0;
     let start = Instant::now();
     while start.elapsed() < dur {
-        std::hint::black_box(model.eval_one(EvalRequest::new(board), device));
+        std::hint::black_box(model.call(board));
         count += 1;
     }
 
@@ -577,27 +576,25 @@ trait Player {
     fn play(&self, board: Bitboard) -> Bitboard;
 }
 
-struct ModelPlayer<'a, B: Backend> {
+struct ModelPlayer<'a> {
     wins: usize,
     wins_as_sente: usize,
     wins_as_gote: usize,
-    model: &'a BurnModel<B>,
-    device: &'a B::Device,
+    model: &'a CandleModel,
 }
 
-impl<'a, B: Backend> ModelPlayer<'a, B> {
-    fn new(model: &'a BurnModel<B>, device: &'a B::Device) -> Self {
+impl<'a> ModelPlayer<'a> {
+    fn new(model: &'a CandleModel) -> Self {
         Self {
             wins: 0,
             wins_as_sente: 0,
             wins_as_gote: 0,
             model,
-            device,
         }
     }
 }
 
-impl<'a, B: Backend> Player for ModelPlayer<'a, B> {
+impl<'a> Player for ModelPlayer<'a> {
     fn record_win(&mut self, sente: bool) {
         self.wins += 1;
         match sente {
@@ -607,7 +604,7 @@ impl<'a, B: Backend> Player for ModelPlayer<'a, B> {
     }
 
     fn play(&self, board: Bitboard) -> Bitboard {
-        let out = self.model.eval_one(EvalRequest::new(board), self.device);
+        let out = self.model.call(board);
         let argmax = out
             .policy
             .into_iter()
@@ -667,9 +664,8 @@ fn play<P1: Player, P2: Player>(sente: &mut P1, gote: &mut P2) -> bool {
     }
 }
 
-fn make_them_fight<B: Backend>(
-    model: &BurnModel<B>,
-    device: &B::Device,
+fn make_them_fight(
+    model: &CandleModel,
     games: usize,
     mcts_sims: u32,
 ) -> (f64, usize, usize) {
@@ -678,7 +674,6 @@ fn make_them_fight<B: Backend>(
         wins_as_sente: 0,
         wins_as_gote: 0,
         model,
-        device,
     };
     let mut mcts_player = MctsPlayer {
         wins: 0,

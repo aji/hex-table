@@ -4,12 +4,32 @@ use rand_distr::{Distribution, multi::Dirichlet};
 
 use crate::{
     bb::Bitboard,
-    nn::{
-        constants::*,
-        model::{EvalRequest, EvalResult, Model},
-    },
+    nn::{constants::*, transform::Transforms},
     util::{Finite, IteratorExt},
 };
+
+pub struct EvalRequest {
+    pub board: Bitboard,
+    pub transform: Transforms,
+}
+
+impl EvalRequest {
+    pub fn new(board: Bitboard) -> Self {
+        Self {
+            board,
+            transform: Transforms::new(),
+        }
+    }
+}
+
+pub struct EvalResult {
+    pub policy: Vec<f32>,
+    pub value: f32,
+}
+
+pub trait Evaluator {
+    fn call(&self, board: Bitboard) -> EvalResult;
+}
 
 pub struct Output {
     pub board_sample: Bitboard,
@@ -236,19 +256,7 @@ impl Tree {
     }
 }
 
-pub fn search<M: Model, Mon: Monitor>(
-    model: &M,
-    device: &M::Device,
-    board: Bitboard,
-    dirichlet: f32,
-    value_decay: f32,
-    mon: Mon,
-) -> Output {
-    let eval = ModelEvaluator { model, device };
-    search_with_evaluator(&eval, board, dirichlet, value_decay, mon)
-}
-
-pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
+pub fn search<E: Evaluator, M: Monitor>(
     eval: &E,
     board: Bitboard,
     dirichlet: f32,
@@ -284,20 +292,5 @@ pub fn search_with_evaluator<E: Evaluator, M: Monitor>(
         values: tree.values(),
         value_sample: tree.value(sample),
         value_best: tree.value(best),
-    }
-}
-
-pub trait Evaluator {
-    fn call(&self, board: Bitboard) -> EvalResult;
-}
-
-struct ModelEvaluator<'a, M: Model> {
-    model: &'a M,
-    device: &'a M::Device,
-}
-
-impl<'a, M: Model> Evaluator for ModelEvaluator<'a, M> {
-    fn call(&self, board: Bitboard) -> EvalResult {
-        self.model.eval_one(EvalRequest::new(board), self.device)
     }
 }

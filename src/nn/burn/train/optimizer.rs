@@ -11,16 +11,13 @@ use burn::optim::{
     GradientsParams, Optimizer, SgdConfig, decay::WeightDecayConfig, momentum::MomentumConfig,
 };
 
-use crate::nn::{
-    burn::{
-        model::{BurnModel, positions_to_input},
-        train::{
-            controller::{ControllerClient, PositionsBuffer},
-            error::TrainError,
-            metrics::CounterLog,
-        },
+use crate::nn::burn::{
+    model::{BurnModel, positions_to_input},
+    train::{
+        controller::{ControllerClient, PositionsBuffer},
+        error::TrainError,
+        metrics::CounterLog,
     },
-    model::Model,
 };
 
 type Wgpu = burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>;
@@ -98,7 +95,7 @@ fn optimizer(cf: AppConfig) {
         .unwrap_or_else(TrainError::unrecoverable)
         .into_data()
         .expect("fetch without etag should always return data");
-    let mut model: BurnModel<Wgpu> = config.init(&device).load_bytes(data, &device);
+    let mut model: BurnModel<Wgpu> = config.init(&device).load_bytes(data);
     let mut optim = SgdConfig::new()
         .with_momentum(Some(MomentumConfig::new().with_momentum(cf.momentum)))
         .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))

@@ -8,7 +8,7 @@ use crate::{
     bb::Bitboard,
     nn::{
         constants::*,
-        model::{EvalRequest, EvalResult, Model, ModelConfig},
+        search::{EvalRequest, EvalResult, Evaluator},
         transform::{Transform, Transpose},
     },
 };
@@ -211,35 +211,35 @@ pub struct CandleModel {
     policy: PolicyHead,
     value: ValueHead,
     device: Device,
-    // Held so future load_bytes/into_bytes can hook into it.
+    // Held so a future weight-loading path can populate it from a checkpoint.
     #[allow(dead_code)]
     varmap: VarMap,
 }
 
 impl CandleModel {
-    fn forward(&self, board: &Tensor) -> Result<(Tensor, Tensor)> {
-        let mut x = self.input.forward(board)?;
-        for block in &self.residual {
-            x = block.forward(&x)?;
-        }
-        let policy = self.policy.forward(&x)?;
-        let value = self.value.forward(&x)?;
-        Ok((policy, value))
+    pub fn new(
+        conv_layers: usize,
+        conv_channels: usize,
+        value_hidden: usize,
+        device: &CandleDevice,
+    ) -> CandleModel {
+        Self::build(conv_layers, conv_channels, value_hidden, device, VarMap::new())
     }
-}
 
-impl ModelConfig {
-    pub fn init_candle(&self, device: &CandleDevice) -> CandleModel {
-        let varmap = VarMap::new();
+    pub(crate) fn build(
+        conv_layers: usize,
+        conv_channels: usize,
+        value_hidden: usize,
+        device: &CandleDevice,
+        varmap: VarMap,
+    ) -> CandleModel {
         let vb = VarBuilder::from_varmap(&varmap, DType::F32, &device.0);
-        let input = ConvInputBlock::new(self.conv_channels, vb.pp("input")).unwrap();
-        let residual = (0..self.conv_layers)
-            .map(|i| {
-                ConvResidualBlock::new(self.conv_channels, vb.pp(format!("residual.{i}"))).unwrap()
-            })
+        let input = ConvInputBlock::new(conv_channels, vb.pp("input")).unwrap();
+        let residual = (0..conv_layers)
+            .map(|i| ConvResidualBlock::new(conv_channels, vb.pp(format!("residual.{i}"))).unwrap())
             .collect();
-        let policy = PolicyHead::new(self.conv_channels, vb.pp("policy")).unwrap();
-        let value = ValueHead::new(self.conv_channels, self.value_hidden, vb.pp("value")).unwrap();
+        let policy = PolicyHead::new(conv_channels, vb.pp("policy")).unwrap();
+        let value = ValueHead::new(conv_channels, value_hidden, vb.pp("value")).unwrap();
         CandleModel {
             input,
             residual,
@@ -249,20 +249,18 @@ impl ModelConfig {
             varmap,
         }
     }
-}
 
-impl Model for CandleModel {
-    type Device = CandleDevice;
-
-    fn load_bytes(self, _bytes: Vec<u8>, _device: &CandleDevice) -> Self {
-        todo!("candle weight format not yet decided; convert from burn first")
+    fn forward(&self, board: &Tensor) -> Result<(Tensor, Tensor)> {
+        let mut x = self.input.forward(board)?;
+        for block in &self.residual {
+            x = block.forward(&x)?;
+        }
+        let policy = self.policy.forward(&x)?;
+        let value = self.value.forward(&x)?;
+        Ok((policy, value))
     }
 
-    fn into_bytes(self) -> Vec<u8> {
-        todo!("candle weight format not yet decided")
-    }
-
-    fn eval_batch(&self, mut reqs: Vec<EvalRequest>, _device: &CandleDevice) -> Vec<EvalResult> {
+    pub fn eval_batch(&self, mut reqs: Vec<EvalRequest>) -> Vec<EvalResult> {
         for req in reqs.iter_mut() {
             if !req.board.sente() {
                 req.transform.push(Transpose::new());
@@ -289,6 +287,15 @@ impl Model for CandleModel {
             res.push(EvalResult { policy, value });
         }
         res
+    }
+}
+
+impl Evaluator for CandleModel {
+    fn call(&self, board: Bitboard) -> EvalResult {
+        self.eval_batch(vec![EvalRequest::new(board)])
+            .into_iter()
+            .next()
+            .unwrap()
     }
 }
 

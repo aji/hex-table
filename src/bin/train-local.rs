@@ -22,11 +22,10 @@ use hex_table::{
     mcts,
     nn::{
         burn::{
-            model::{BurnModel, BurnModelRecord, BurnModelRecordItem, positions_to_input},
+            model::{BurnModel, BurnModelRecord, BurnModelRecordItem, ModelConfig, positions_to_input},
             train::positions::Position,
         },
-        model::{EvalRequest, EvalResult, Model, ModelConfig},
-        search::{Evaluator, search_with_evaluator},
+        search::{EvalRequest, EvalResult, Evaluator, search},
         transform::{Transform, Transforms, Transpose},
     },
 };
@@ -214,7 +213,7 @@ fn evaluator(ctx: Context, inbox: Receiver<EvaluatorMsg>) {
         let (reqs, rets): (Vec<_>, Vec<_>) = std::mem::take(&mut pending).into_iter().unzip();
         for (ret, res) in rets
             .into_iter()
-            .zip(model.eval_batch(reqs, &device).into_iter())
+            .zip(model.eval_batch(reqs).into_iter())
         {
             ret.send(res).unwrap();
         }
@@ -253,7 +252,7 @@ fn self_play(idx: usize, ctx: Context) {
             let limit = 600 + idx;
             let eval = BatchEvaluator(&ctx);
             let out =
-                search_with_evaluator(&eval, board, SELF_PLAY_DIRICHLET, 0.0, |n: usize| n < limit);
+                search(&eval, board, SELF_PLAY_DIRICHLET, 0.0, |n: usize| n < limit);
             let (board, value) = if depth < SELF_PLAY_SAMPLE_THRESHOLD {
                 (out.board_sample, out.value_sample)
             } else {

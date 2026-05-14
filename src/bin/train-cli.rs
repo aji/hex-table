@@ -4,13 +4,15 @@ use clap::{Parser, Subcommand};
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
     nn::{
-        burn::train::{
-            controller::ControllerClient,
-            error::TrainError,
-            positions::{Position, SERIALIZED_LEN},
+        burn::{
+            model::ModelConfig,
+            train::{
+                controller::ControllerClient,
+                error::TrainError,
+                positions::{Position, SERIALIZED_LEN},
+            },
         },
-        model::{EvalRequest, Model, ModelConfig},
-        search::search,
+        search::{Evaluator, search},
         transform::Transpose,
     },
     util::{Finite, IteratorExt},
@@ -181,7 +183,7 @@ fn play(
     type B = burn::backend::Wgpu<f32, i32>;
     let device = Default::default();
     let model = config.init::<B>(&device);
-    let model = model.load_bytes(data, &device);
+    let model = model.load_bytes(data);
 
     let start = Instant::now();
     let mut board = Bitboard::new();
@@ -194,7 +196,7 @@ fn play(
         }
         if iters > 0 {
             println!("({:?})\n{}", start.elapsed(), BitboardPretty(&board));
-            let out = search(&model, &device, board, 0.0, value_decay, |n: usize| {
+            let out = search(&model, board, 0.0, value_decay, |n: usize| {
                 print!("\x1b[G\x1b[K{n}/{iters} {:.1}%", n as f64 * 100.0 / iters as f64);
                 std::io::stdout().flush().ok();
                 n < iters
@@ -214,7 +216,7 @@ fn play(
                 println!("({:?}) value={}", start.elapsed(), out.value_best);
             }
         } else {
-            let out = model.eval_one(EvalRequest::new(board), &device);
+            let out = model.call(board);
             let policy = out
                 .policy
                 .iter()

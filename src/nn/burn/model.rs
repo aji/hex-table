@@ -42,7 +42,7 @@
 //! > 6. A fully connected linear layer to a scalar
 //! > 7. A tanh nonlinearity outputting a scalar in the range [−1, 1]
 
-use std::sync::LazyLock;
+use std::{fs, io, path::Path, sync::LazyLock};
 
 use burn::{
     Tensor,
@@ -61,13 +61,14 @@ use burn::{
         ops::ConvOptions,
     },
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     bb::Bitboard,
     nn::{
         burn::train::positions::Position,
         constants::*,
-        model::{EvalRequest, EvalResult, Model, ModelConfig},
+        search::{EvalRequest, EvalResult, Evaluator},
         transform::{Transform, Transpose},
     },
 };
@@ -368,18 +369,22 @@ impl<B: Backend> BurnModel<B> {
     }
 }
 
-impl<B: Backend> Model for BurnModel<B> {
-    type Device = B::Device;
-
-    fn load_bytes(self, bytes: Vec<u8>, device: &B::Device) -> Self {
-        self.load_record(BYTES_RECORDER.load(bytes, device).unwrap())
+impl<B: Backend> BurnModel<B> {
+    fn device(&self) -> B::Device {
+        self.input.conv.kernel.val().device()
     }
 
-    fn into_bytes(self) -> Vec<u8> {
+    pub fn load_bytes(self, bytes: Vec<u8>) -> Self {
+        let device = self.device();
+        self.load_record(BYTES_RECORDER.load(bytes, &device).unwrap())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
         BYTES_RECORDER.record(self.into_record(), ()).unwrap()
     }
 
-    fn eval_batch(&self, mut reqs: Vec<EvalRequest>, device: &B::Device) -> Vec<EvalResult> {
+    pub fn eval_batch(&self, mut reqs: Vec<EvalRequest>) -> Vec<EvalResult> {
+        let device = self.device();
         for req in reqs.iter_mut() {
             if !req.board.sente() {
                 req.transform.push(Transpose::new());
@@ -390,7 +395,7 @@ impl<B: Backend> Model for BurnModel<B> {
             .iter()
             .map(|x| x.transform.apply_board(x.board))
             .collect();
-        let boards_ten = boards_to_tensor(boards.iter().copied(), device);
+        let boards_ten = boards_to_tensor(boards.iter().copied(), &device);
 
         let (policy, value) = self.forward(boards_ten);
         let [policy, value] = Transaction::default()
@@ -416,7 +421,62 @@ impl<B: Backend> Model for BurnModel<B> {
     }
 }
 
+impl<B: Backend> Evaluator for BurnModel<B> {
+    fn call(&self, board: Bitboard) -> EvalResult {
+        self.eval_batch(vec![EvalRequest::new(board)])
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelConfig {
+    pub conv_layers: usize,
+    pub conv_channels: usize,
+    pub value_hidden: usize,
+}
+
 impl ModelConfig {
+    pub fn new(conv_layers: usize, conv_channels: usize, value_hidden: usize) -> Self {
+        Self {
+            conv_layers,
+            conv_channels,
+            value_hidden,
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        let (version, s) = id.split_once("-")?;
+
+        if version != "v0" {
+            return None;
+        }
+
+        let (conv_layers, s) = s.split_once("-")?;
+        let (conv_channels, value_hidden) = s.split_once("-")?;
+
+        Some(ModelConfig {
+            conv_layers: conv_layers.parse().ok()?,
+            conv_channels: conv_channels.parse().ok()?,
+            value_hidden: value_hidden.parse().ok()?,
+        })
+    }
+
+    pub fn id(&self) -> String {
+        format!("v0-{}-{}-{}", self.conv_layers, self.conv_channels, self.value_hidden)
+    }
+
+    pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        let bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
+        fs::write(path, bytes)
+    }
+
+    pub fn load<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        serde_json::from_slice(&bytes).map_err(io::Error::other)
+    }
+
     pub fn init<B: Backend>(&self, device: &B::Device) -> BurnModel<B> {
         BurnModel {
             input: ConvInputBlockConfig::new(self.conv_channels).init(device),

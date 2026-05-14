@@ -21,16 +21,13 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use time::{UtcDateTime, format_description::well_known::Rfc3339};
 
-use crate::nn::{
-    burn::{
-        model::BurnModel,
-        train::{
-            error::{TrainError, TrainResult},
-            positions::{Position, Positions, SERIALIZED_LEN},
-            retry::DEFAULT_RETRY,
-        },
+use crate::nn::burn::{
+    model::{BurnModel, ModelConfig},
+    train::{
+        error::{TrainError, TrainResult},
+        positions::{Position, Positions, SERIALIZED_LEN},
+        retry::DEFAULT_RETRY,
     },
-    model::{Model, ModelConfig},
 };
 
 const X_HEX_THIS_ITERS: header::HeaderName = header::HeaderName::from_static("x-hex-this-iters");

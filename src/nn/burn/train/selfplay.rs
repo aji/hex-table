@@ -13,7 +13,7 @@ use crate::{
     bb::Bitboard,
     nn::{
         burn::{
-            model::BurnModel,
+            model::{BurnModel, ModelConfig},
             train::{
                 controller::{ControllerClient, FetchModelData},
                 error::TrainError,
@@ -21,8 +21,7 @@ use crate::{
                 positions::{Position, SERIALIZED_LEN},
             },
         },
-        model::{EvalRequest, EvalResult, Model, ModelConfig},
-        search::{Evaluator, search_with_evaluator},
+        search::{EvalRequest, EvalResult, Evaluator, search},
         transform::Transpose,
     },
 };
@@ -115,7 +114,7 @@ fn spawn_evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
 fn evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
     let device = Default::default();
     let mut model: BurnModel<Wgpu> = match inbox.recv() {
-        Ok(EvaluatorMsg::Init(config, data)) => config.init(&device).load_bytes(data, &device),
+        Ok(EvaluatorMsg::Init(config, data)) => config.init(&device).load_bytes(data),
         _ => panic!("expected an init message"),
     };
 
@@ -131,7 +130,7 @@ fn evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
             }
             Ok(EvaluatorMsg::ModelUpdated(data)) => {
                 log::info!("loading updated model");
-                model = model.load_bytes(data, &device);
+                model = model.load_bytes(data);
                 false
             }
             Ok(EvaluatorMsg::Queue(board, ret)) => {
@@ -151,7 +150,7 @@ fn evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
         let rets = std::mem::take(&mut rets);
         for (ret, res) in rets
             .into_iter()
-            .zip(model.eval_batch(reqs, &device).into_iter())
+            .zip(model.eval_batch(reqs).into_iter())
         {
             ret.send(res).unwrap();
         }
@@ -260,7 +259,7 @@ fn self_play(_idx: usize, cf: AppConfig) {
         let mut board = Bitboard::new();
         let mut log: Vec<(Bitboard, [f32; 121])> = Vec::new();
         while board.win().is_none() {
-            let out = search_with_evaluator(&cf, board, 0.25, 0.0, monitor);
+            let out = search(&cf, board, 0.25, 0.0, monitor);
             cf.total_moves.fetch_add(1, Ordering::Relaxed);
             log.push((board, out.policy.try_into().unwrap()));
             board = if log.len() < 30 { out.board_sample } else { out.board_best };

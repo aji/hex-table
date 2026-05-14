@@ -317,7 +317,7 @@ impl EventHandler<Context, GameError> for MainState {
 }
 
 fn main() -> GameResult {
-    let cb = ContextBuilder::new("github.com/aji/hex", "Hex")
+    let cb = ContextBuilder::new("github.com/aji/hex-table", "Hex")
         .window_mode(WindowMode::default().dimensions(WIDTH, HEIGHT));
     let (mut ctx, ev) = cb.build()?;
     let state = MainState::new(&mut ctx)?;
