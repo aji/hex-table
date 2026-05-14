@@ -1,6 +1,5 @@
 use std::ops::ControlFlow;
 
-use burn::tensor::backend::Backend;
 use rand_distr::{Distribution, multi::Dirichlet};
 
 use crate::{
@@ -237,13 +236,13 @@ impl Tree {
     }
 }
 
-pub fn search<B: Backend, M: Monitor>(
-    model: &Model<B>,
-    device: &B::Device,
+pub fn search<M: Model, Mon: Monitor>(
+    model: &M,
+    device: &M::Device,
     board: Bitboard,
     dirichlet: f32,
     value_decay: f32,
-    mon: M,
+    mon: Mon,
 ) -> Output {
     let eval = ModelEvaluator { model, device };
     search_with_evaluator(&eval, board, dirichlet, value_decay, mon)
@@ -292,12 +291,12 @@ pub trait Evaluator {
     fn call(&self, board: Bitboard) -> EvalResult;
 }
 
-struct ModelEvaluator<'a, B: Backend> {
-    model: &'a Model<B>,
-    device: &'a B::Device,
+struct ModelEvaluator<'a, M: Model> {
+    model: &'a M,
+    device: &'a M::Device,
 }
 
-impl<'a, B: Backend> Evaluator for ModelEvaluator<'a, B> {
+impl<'a, M: Model> Evaluator for ModelEvaluator<'a, M> {
     fn call(&self, board: Bitboard) -> EvalResult {
         self.model.eval_one(EvalRequest::new(board), self.device)
     }

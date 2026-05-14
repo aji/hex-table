@@ -6,8 +6,10 @@ edition = "2024"
 [dependencies]
 axum = "0.8.9"
 bumpalo = { version = "3.20.2" }
-burn = { version = "0.20.1", features = ["wgpu", "fusion", "autodiff", "std", "ndarray"] }
+burn = { version = "0.20.1", features = ["wgpu", "fusion", "autodiff", "std", "ndarray"], optional = true }
 bytes = "1.11.1"
+candle-core = { version = "0.10.2", optional = true }
+candle-nn = { version = "0.10.2", optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
 env_logger = "0.11.10"
 ggez = { version = "0.10.0-rc0", optional = true }
@@ -17,7 +19,7 @@ rand = "0.10.1"
 rand_distr = "0.6.0"
 rayon = "1.12.0"
 reqwest = { version = "0.13.3", features = ["blocking", "json"] }
-serde = "1.0.228"
+serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha2 = "0.11.0"
 time = { version = "0.3.47", features = ["formatting"] }
@@ -25,9 +27,12 @@ tokio = { version = "1.52.2", features = ["full"] }
 tqdm = "0.8.0"
 
 [features]
-default = ["nn"]
+default = ["nn", "burn"]
 ui = ["dep:ggez"]
 nn = []
+burn = ["nn", "dep:burn"]
+candle = ["nn", "dep:candle-core", "dep:candle-nn"]
+candle-metal = ["candle", "candle-core/metal", "candle-nn/metal"]
 
 [[bin]]
 name = "play"
@@ -35,12 +40,16 @@ required-features = ["ui"]
 
 [[bin]]
 name = "train-cli"
-required-features = ["nn"]
+required-features = ["burn"]
 
 [[bin]]
 name = "train-daemon"
-required-features = ["nn"]
+required-features = ["burn"]
 
 [[bin]]
 name = "train-local"
-required-features = ["nn"]
+required-features = ["burn"]
+
+[[bin]]
+name = "train-benchmark"
+required-features = ["burn"]

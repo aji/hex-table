@@ -1,4 +1,4 @@
-use hex_table::nn::train;
+use hex_table::nn::burn::train;
 
 fn main() {
     env_logger::init();

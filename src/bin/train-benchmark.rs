@@ -8,12 +8,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-use burn::{config::Config, tensor::backend::Backend};
+use burn::tensor::backend::Backend;
 use clap::{Parser, Subcommand};
 use hex_table::{
     bb::Bitboard,
     mcts::{self, MctsMonitor, MctsStats},
-    nn::model::{EvalRequest, Model, ModelConfig},
+    nn::{
+        burn::model::BurnModel,
+        model::{EvalRequest, Model, ModelConfig},
+    },
     util::{Finite, IteratorExt},
 };
 use tqdm::Iter;
@@ -46,7 +49,7 @@ fn main() -> io::Result<()> {
     let config =
         ModelConfig::load(cli.model_dir.join("config.json")).expect("could not load model config");
     log::info!("loaded model config: {config:?}");
-    let model: Model<Wgpu> = config.init(&device);
+    let model: BurnModel<Wgpu> = config.init(&device);
 
     let checkpoints = {
         let mut checkpoints = std::fs::read_dir(&cli.model_dir)
@@ -90,7 +93,7 @@ fn cmd_compare<B: Backend>(
     cli: &Cli,
     cmd: &CompareCommand,
     mut checkpoints: Vec<String>,
-    mut model: Model<B>,
+    mut model: BurnModel<B>,
     device: B::Device,
 ) -> io::Result<()> {
     if let Some(n) = cmd.checkpoints
@@ -190,7 +193,7 @@ fn cmd_rank<B: Backend>(
     cli: &Cli,
     cmd: &RankCommand,
     checkpoints: Vec<String>,
-    model: Model<B>,
+    model: BurnModel<B>,
     device: B::Device,
 ) -> io::Result<()> {
     let nn_evals_per_time = bench_model_evals(&model, &device, true);
@@ -251,7 +254,7 @@ fn cmd_rank<B: Backend>(
 }
 
 struct RankOne<'a, B: Backend> {
-    model: &'a Model<B>,
+    model: &'a BurnModel<B>,
     device: &'a B::Device,
     compute_equiv_rank: f64,
     stddev_stop: Option<f64>,
@@ -515,7 +518,7 @@ impl<S> MctsMonitor<S> for MctsSims {
     }
 }
 
-fn bench_model_evals<B: Backend>(model: &Model<B>, device: &B::Device, fast: bool) -> f64 {
+fn bench_model_evals<B: Backend>(model: &BurnModel<B>, device: &B::Device, fast: bool) -> f64 {
     let board = Bitboard::new();
 
     log::info!("benchmarking model evals");
@@ -578,12 +581,12 @@ struct ModelPlayer<'a, B: Backend> {
     wins: usize,
     wins_as_sente: usize,
     wins_as_gote: usize,
-    model: &'a Model<B>,
+    model: &'a BurnModel<B>,
     device: &'a B::Device,
 }
 
 impl<'a, B: Backend> ModelPlayer<'a, B> {
-    fn new(model: &'a Model<B>, device: &'a B::Device) -> Self {
+    fn new(model: &'a BurnModel<B>, device: &'a B::Device) -> Self {
         Self {
             wins: 0,
             wins_as_sente: 0,
@@ -665,7 +668,7 @@ fn play<P1: Player, P2: Player>(sente: &mut P1, gote: &mut P2) -> bool {
 }
 
 fn make_them_fight<B: Backend>(
-    model: &Model<B>,
+    model: &BurnModel<B>,
     device: &B::Device,
     games: usize,
     mcts_sims: u32,

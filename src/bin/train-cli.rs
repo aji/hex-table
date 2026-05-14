@@ -4,13 +4,13 @@ use clap::{Parser, Subcommand};
 use hex_table::{
     bb::{Bitboard, BitboardPretty},
     nn::{
-        model::{EvalRequest, ModelConfig},
-        search::search,
-        train::{
+        burn::train::{
             controller::ControllerClient,
             error::TrainError,
             positions::{Position, SERIALIZED_LEN},
         },
+        model::{EvalRequest, Model, ModelConfig},
+        search::search,
         transform::Transpose,
     },
     util::{Finite, IteratorExt},

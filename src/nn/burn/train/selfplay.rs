@@ -12,14 +12,17 @@ use bytes::BytesMut;
 use crate::{
     bb::Bitboard,
     nn::{
+        burn::{
+            model::BurnModel,
+            train::{
+                controller::{ControllerClient, FetchModelData},
+                error::TrainError,
+                metrics::CounterLog,
+                positions::{Position, SERIALIZED_LEN},
+            },
+        },
         model::{EvalRequest, EvalResult, Model, ModelConfig},
         search::{Evaluator, search_with_evaluator},
-        train::{
-            controller::{ControllerClient, FetchModelData},
-            error::TrainError,
-            metrics::CounterLog,
-            positions::{Position, SERIALIZED_LEN},
-        },
         transform::Transpose,
     },
 };
@@ -111,7 +114,7 @@ fn spawn_evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
 
 fn evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
     let device = Default::default();
-    let mut model: Model<Wgpu> = match inbox.recv() {
+    let mut model: BurnModel<Wgpu> = match inbox.recv() {
         Ok(EvaluatorMsg::Init(config, data)) => config.init(&device).load_bytes(data, &device),
         _ => panic!("expected an init message"),
     };

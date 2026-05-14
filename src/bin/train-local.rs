@@ -21,12 +21,12 @@ use hex_table::{
     bb::{Bitboard, BitboardPretty},
     mcts,
     nn::{
-        model::{
-            EvalRequest, EvalResult, Model, ModelConfig, ModelRecord, ModelRecordItem,
-            positions_to_input,
+        burn::{
+            model::{BurnModel, BurnModelRecord, BurnModelRecordItem, positions_to_input},
+            train::positions::Position,
         },
+        model::{EvalRequest, EvalResult, Model, ModelConfig},
         search::{Evaluator, search_with_evaluator},
-        train::positions::Position,
         transform::{Transform, Transforms, Transpose},
     },
 };
@@ -44,7 +44,7 @@ const SELF_PLAY_SAMPLE_THRESHOLD: usize = 30;
 #[derive(Clone)]
 struct Context {
     config: ModelConfig,
-    latest: Arc<RwLock<ModelRecordItem<Back, Prec>>>,
+    latest: Arc<RwLock<BurnModelRecordItem<Back, Prec>>>,
     positions: Arc<RwLock<PositionBuffer>>,
     evaluator: Sender<EvaluatorMsg>,
 }
@@ -61,17 +61,17 @@ impl Context {
         }
     }
 
-    fn init(&self, device: &Dev) -> Model<Back> {
+    fn init(&self, device: &Dev) -> BurnModel<Back> {
         self.config.init::<Back>(device)
     }
 
-    fn load_latest(&self, model: Model<Back>, device: &Dev) -> Model<Back> {
+    fn load_latest(&self, model: BurnModel<Back>, device: &Dev) -> BurnModel<Back> {
         let item = self.latest.read().unwrap().clone();
-        let rec = ModelRecord::from_item(item, device);
+        let rec = BurnModelRecord::from_item(item, device);
         model.load_record(rec)
     }
 
-    fn save_latest(&self, model: &Model<Back>) {
+    fn save_latest(&self, model: &BurnModel<Back>) {
         let rec = model.clone().into_record();
         let item = rec.into_item();
         *self.latest.write().unwrap() = item;
@@ -273,7 +273,7 @@ fn optimizer(ctx: Context) {
     let mut optim = SgdConfig::new()
         .with_momentum(Some(MomentumConfig::new().with_momentum(0.7)))
         .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-        .init::<Back, Model<Back>>();
+        .init::<Back, BurnModel<Back>>();
     model = ctx.load_latest(model, &device);
 
     let mut last_print = Instant::now();

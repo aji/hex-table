@@ -15,7 +15,6 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use burn::config::Config;
 use iddqd::{IdHashItem, IdHashMap, id_hash_map::RefMut, id_upcast};
 use reqwest::{blocking::Client, header};
 use serde::{Deserialize, Serialize};
@@ -23,12 +22,15 @@ use sha2::Digest;
 use time::{UtcDateTime, format_description::well_known::Rfc3339};
 
 use crate::nn::{
-    model::{Model, ModelConfig},
-    train::{
-        error::{TrainError, TrainResult},
-        positions::{Position, Positions, SERIALIZED_LEN},
-        retry::DEFAULT_RETRY,
+    burn::{
+        model::BurnModel,
+        train::{
+            error::{TrainError, TrainResult},
+            positions::{Position, Positions, SERIALIZED_LEN},
+            retry::DEFAULT_RETRY,
+        },
     },
+    model::{Model, ModelConfig},
 };
 
 const X_HEX_THIS_ITERS: header::HeaderName = header::HeaderName::from_static("x-hex-this-iters");
@@ -331,7 +333,7 @@ impl ModelInfo {
             positions,
         };
 
-        let model: Model<burn::backend::NdArray> = info.config.init(&Default::default());
+        let model: BurnModel<burn::backend::NdArray> = info.config.init(&Default::default());
         let bytes = model.into_bytes();
         info.write_checkpoint(&bytes, None, None)?;
 

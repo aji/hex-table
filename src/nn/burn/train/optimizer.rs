@@ -12,12 +12,15 @@ use burn::optim::{
 };
 
 use crate::nn::{
-    model::{Model, positions_to_input},
-    train::{
-        controller::{ControllerClient, PositionsBuffer},
-        error::TrainError,
-        metrics::CounterLog,
+    burn::{
+        model::{BurnModel, positions_to_input},
+        train::{
+            controller::{ControllerClient, PositionsBuffer},
+            error::TrainError,
+            metrics::CounterLog,
+        },
     },
+    model::Model,
 };
 
 type Wgpu = burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>;
@@ -95,11 +98,11 @@ fn optimizer(cf: AppConfig) {
         .unwrap_or_else(TrainError::unrecoverable)
         .into_data()
         .expect("fetch without etag should always return data");
-    let mut model: Model<Wgpu> = config.init(&device).load_bytes(data, &device);
+    let mut model: BurnModel<Wgpu> = config.init(&device).load_bytes(data, &device);
     let mut optim = SgdConfig::new()
         .with_momentum(Some(MomentumConfig::new().with_momentum(cf.momentum)))
         .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-        .init::<Wgpu, Model<Wgpu>>();
+        .init::<Wgpu, BurnModel<Wgpu>>();
 
     let mut last_upload = Instant::now();
     let mut loss_total = 0.0;
