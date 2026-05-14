@@ -11,14 +11,14 @@ use hex_table::{
     mcts::{self, MctsStats},
 };
 
-fn run_once(black_rollouts: u32, white_rollouts: u32) -> bool {
+fn run_once(black_rollouts: u32, white_rollouts: u32) -> (bool, usize) {
     let mut board = Bitboard::new();
     // println!("\n\nSTART: {black_rollouts} VS {white_rollouts}\n");
     for turn in 0.. {
         // println!("\n{}", BitboardPretty(&board));
         if let Some(win) = board.win() {
             // println!("{} wins", if win { "black" } else { "white" });
-            return win;
+            return (win, turn);
         }
         let max_sims = match turn % 2 == 0 {
             true => black_rollouts,
@@ -47,7 +47,15 @@ fn main() {
             .open(CSV)
             .unwrap(),
     ));
-    write!(f.lock().unwrap(), "{},{},{}\n", "black_rollouts", "white_rollouts", "result").unwrap();
+    write!(
+        f.lock().unwrap(),
+        "{},{},{},{}\n",
+        "black_rollouts",
+        "white_rollouts",
+        "result",
+        "duration_iters"
+    )
+    .unwrap();
     let pbar = Arc::new(Mutex::new(tqdm::pbar(Some(GAMES))));
     (0..GAMES).into_par_iter().for_each({
         let f = f.clone();
@@ -55,13 +63,14 @@ fn main() {
         move |_| {
             let black_rollouts = 121.0f64.powf(rand::random_range(2.0..=3.5)) as u32;
             let white_rollouts = 121.0f64.powf(rand::random_range(2.0..=3.5)) as u32;
-            let result = run_once(black_rollouts, white_rollouts);
+            let (result, duration) = run_once(black_rollouts, white_rollouts);
             write!(
                 f.lock().unwrap(),
-                "{},{},{}\n",
+                "{},{},{},{}\n",
                 black_rollouts,
                 white_rollouts,
-                result as usize
+                result as usize,
+                duration
             )
             .unwrap();
             pbar.lock().unwrap().update(1).ok();
