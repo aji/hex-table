@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use candle_core::{DType, Device, ModuleT, Result, Tensor};
 use candle_nn::{
     BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, Linear, VarBuilder, VarMap,
@@ -205,6 +207,16 @@ impl ValueHead {
     }
 }
 
+/// A candle-backed inference model.
+///
+/// `CandleModel: Send + Sync`, but concurrent calls to [`Self::eval_batch`]
+/// from multiple threads will corrupt candle's internal state and silently
+/// produce NaN policies. To make this misuse loud, every entry to
+/// `eval_batch` swaps an [`AtomicBool`] guard and panics on contention rather
+/// than running. Serialize calls (e.g. via a [`Mutex`] or a single-threaded
+/// executor) at the call site if you need to share one model across threads.
+///
+/// [`Mutex`]: std::sync::Mutex
 pub struct CandleModel {
     input: ConvInputBlock,
     residual: Vec<ConvResidualBlock>,
@@ -214,6 +226,36 @@ pub struct CandleModel {
     // Held so a future weight-loading path can populate it from a checkpoint.
     #[allow(dead_code)]
     varmap: VarMap,
+    in_flight: AtomicBool,
+}
+
+/// RAII guard that flips [`CandleModel::in_flight`] true on entry and false
+/// on drop. Panics on entry if the flag was already set, indicating another
+/// thread is mid-`eval_batch`.
+struct InFlightGuard<'a>(&'a AtomicBool);
+
+impl<'a> InFlightGuard<'a> {
+    fn enter(flag: &'a AtomicBool) -> Self {
+        if flag
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            panic!(
+                "CandleModel::eval_batch was called concurrently from multiple threads. \
+                 The candle backend is not safe for concurrent forward passes — \
+                 unguarded concurrent use silently produces NaN policies. \
+                 Serialize calls to this model (e.g. wrap it in a Mutex, or pin \
+                 the work to a single-threaded rayon pool) before retrying."
+            );
+        }
+        InFlightGuard(flag)
+    }
+}
+
+impl<'a> Drop for InFlightGuard<'a> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl CandleModel {
@@ -247,6 +289,7 @@ impl CandleModel {
             value,
             device: device.0.clone(),
             varmap,
+            in_flight: AtomicBool::new(false),
         }
     }
 
@@ -261,6 +304,8 @@ impl CandleModel {
     }
 
     pub fn eval_batch(&self, mut reqs: Vec<EvalRequest>) -> Vec<EvalResult> {
+        let _guard = InFlightGuard::enter(&self.in_flight);
+
         for req in reqs.iter_mut() {
             if !req.board.sente() {
                 req.transform.push(Transpose::new());

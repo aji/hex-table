@@ -3887,6 +3887,7 @@ dependencies = [
  "clap",
  "env_logger",
  "ggez",
+ "glob",
  "iddqd",
  "log",
  "rand 0.10.1",
