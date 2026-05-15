@@ -86,7 +86,9 @@ impl Positions {
     pub fn push_serialized_many(&mut self, data: &[u8]) -> io::Result<()> {
         let len = data.len();
         if !len.is_multiple_of(SERIALIZED_LEN) {
-            return Err(io::Error::other("positions size be a multiple of SERIALIZED_LEN"));
+            return Err(io::Error::other(
+                "positions size be a multiple of SERIALIZED_LEN",
+            ));
         }
         self.count += len / SERIALIZED_LEN;
         self.file.write_all(data)?;

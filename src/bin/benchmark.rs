@@ -4,7 +4,7 @@ use std::{
     io::{self, Write},
     ops::ControlFlow,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
@@ -14,12 +14,10 @@ use hex_table::{
     mcts::{self, MctsMonitor, MctsStats},
     nn::{
         candle::model::{CandleDevice, CandleModel},
-        search::{Evaluator, search as nn_search},
+        search::search as nn_search,
     },
     util::{Finite, IteratorExt},
 };
-use rayon::prelude::*;
-use tqdm::Iter;
 
 #[derive(Parser, Debug)]
 struct Cli {
@@ -29,9 +27,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    Compare(CompareCommand),
     Rank(RankCommand),
-    Calibrate(CalibrateCommand),
 }
 
 fn main() -> io::Result<()> {
@@ -44,9 +40,7 @@ fn main() -> io::Result<()> {
     log::info!("device: {device:?}");
 
     match cli.command {
-        Commands::Compare(ref cmd) => cmd_compare(cmd, &device),
         Commands::Rank(ref cmd) => cmd_rank(cmd, &device),
-        Commands::Calibrate(ref cmd) => cmd_calibrate(cmd, &device),
     }
 }
 
@@ -55,369 +49,204 @@ fn load_checkpoint(path: &Path, device: &CandleDevice) -> io::Result<CandleModel
     CandleModel::load_burn(&bytes, device).map_err(io::Error::other)
 }
 
-fn list_checkpoints(model_dir: &Path) -> io::Result<Vec<String>> {
-    let mut checkpoints = std::fs::read_dir(model_dir)?
-        .filter_map(|x| x.ok())
-        .flat_map(|x| x.file_name().into_string().into_iter())
-        .filter(|x| x.starts_with("checkpoint-"))
-        .collect::<Vec<_>>();
-    checkpoints.sort();
-    log::info!("found {} checkpoints in {}", checkpoints.len(), model_dir.display());
-    Ok(checkpoints)
-}
+// ============================================================================
+// rank
+// ============================================================================
 
-/// Compare model checkpoints to an MCTS benchmark player
-#[derive(Parser, Debug)]
-struct CompareCommand {
-    /// The model directory
-    #[arg(long, value_name = "DIR")]
-    model_dir: PathBuf,
-
-    /// The CSV file to write results to
-    #[arg(long, value_name = "FILE", default_value = "compare-mcts.csv")]
-    output: PathBuf,
-
-    /// The number of games to play per eval
-    #[arg(long, value_name = "N", default_value = "50")]
-    games: usize,
-
-    /// The number of recent checkpoints to use. If omitted, all checkpoints are used.
-    #[arg(long, value_name = "N")]
-    checkpoints: Option<usize>,
-
-    /// Multiplies the MCTS player's CPU allocation by 10^F
-    #[arg(long, value_name = "F", default_value = "0.0")]
-    mcts_handicap: f64,
-}
-
-fn cmd_compare(cmd: &CompareCommand, device: &CandleDevice) -> io::Result<()> {
-    let mut checkpoints = list_checkpoints(&cmd.model_dir)?;
-
-    if let Some(n) = cmd.checkpoints
-        && n < checkpoints.len()
-    {
-        log::info!("using only {n} most recent checkpoints");
-        let _ = checkpoints.drain(..checkpoints.len() - n);
-    }
-
-    let first = checkpoints
-        .first()
-        .ok_or_else(|| io::Error::other("no checkpoints"))?;
-    let nn_evals_per_time = {
-        let model = load_checkpoint(&cmd.model_dir.join(first), device)?;
-        bench_model_evals(&model, false)
-    };
-    let mcts_evals_per_time = bench_mcts_evals(false);
-
-    let mcts_per_nn_base = (mcts_evals_per_time / nn_evals_per_time).round() as u32;
-    let mcts_per_nn =
-        (10.0f64.powf(cmd.mcts_handicap) * mcts_evals_per_time / nn_evals_per_time).round() as u32;
-    log::info!(
-        "roughly {} mcts evals per nn eval ({} with handicap)",
-        mcts_per_nn_base,
-        mcts_per_nn
-    );
-
-    let mut out = std::fs::OpenOptions::new()
-        .truncate(true)
-        .create(true)
-        .write(true)
-        .open(&cmd.output)?;
-    writeln!(
-        out,
-        "{},{},{},{},{},{},{}",
-        "checkpoint",
-        "games",
-        "mcts_per_nn",
-        "mcts_handicap",
-        "win_rate",
-        "wins_as_sente",
-        "wins_as_gote",
-    )?;
-    out.flush().ok();
-
-    log::info!("running {} games per checkpoint", cmd.games);
-    if !cmd.games.is_multiple_of(2) {
-        log::warn!(
-            "odd number of games per checkpoint is not recommended due to slight first-player advantage"
-        );
-    }
-    for checkpoint in checkpoints.iter().tqdm() {
-        let model = load_checkpoint(&cmd.model_dir.join(checkpoint), device)?;
-        let (win_rate, wins_as_sente, wins_as_gote) =
-            make_them_fight(&model, cmd.games, mcts_per_nn);
-        writeln!(
-            out,
-            "{},{},{},{},{},{},{}",
-            checkpoint,
-            cmd.games,
-            mcts_per_nn,
-            cmd.mcts_handicap,
-            win_rate,
-            wins_as_sente,
-            wins_as_gote,
-        )?;
-        out.flush().ok();
-    }
-
-    Ok(())
-}
-
-/// Match a subject strategy's performance against a baseline strategy whose
-/// strength is varied via Bayesian inference until the win rate balances.
+/// Bayesian estimate of the compute-time handicap at which a fixed `subject`
+/// strategy ties with a `baseline` strategy.
 ///
-/// Baseline spec: `mcts:LO-HI` or `model:LO-HI:PATH` (range defines the prior
-/// support; for mcts, `10^rank` rollouts; for model, `10^rank` nn-search iters).
-/// Subject spec: `mcts:RANK` or `model:RANK:GLOB` (fixed rank; for model, the
-/// glob expands to one CSV row per matched checkpoint; `model:0` is intuition).
+/// The prior is over `handicap = log10(baseline_time / subject_time)` — i.e.,
+/// the log compute-time factor the baseline gets relative to the subject.
+/// Each iteration plays one game with per-turn time budgets derived
+/// symmetrically from the current argmax handicap, observes the effective
+/// handicap from the actual time each side spent, and updates the prior with
+/// the observed handicap (not the suggested one).
 #[derive(Parser, Debug)]
 struct RankCommand {
-    /// Baseline strategy spec
-    #[arg(long, value_name = "SPEC", value_parser = parse_baseline)]
-    baseline: BaselineSpec,
+    /// Baseline checkpoint path. Omit for an MCTS baseline.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<PathBuf>,
 
-    /// Subject strategy spec
-    #[arg(long, value_name = "SPEC", value_parser = parse_subject)]
-    subject: SubjectSpec,
+    /// Subject checkpoint paths (one row per path). Omit for a single MCTS
+    /// subject; pass multiple to rank a whole set — shell-expand globs.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    subject: Vec<PathBuf>,
 
     /// CSV file to write results to. If omitted, no CSV is written.
     #[arg(long, value_name = "FILE")]
     output: Option<PathBuf>,
 
-    /// Stop at the given stddev cutoff
+    /// Stop at the given stddev cutoff.
     #[arg(long, value_name = "X")]
     stddev_stop: Option<f64>,
 
-    /// Stop at the given number of iterations
+    /// Stop at the given number of iterations.
     #[arg(long, value_name = "N")]
     iters_stop: Option<usize>,
 
+    /// Lower bound of the handicap prior.
+    #[arg(
+        long,
+        value_name = "X",
+        default_value = "-3.0",
+        allow_hyphen_values = true
+    )]
+    prior_min: f64,
+
+    /// Upper bound of the handicap prior.
+    #[arg(
+        long,
+        value_name = "X",
+        default_value = "3.0",
+        allow_hyphen_values = true
+    )]
+    prior_max: f64,
+
+    /// Per-turn base time, in seconds. Subject and baseline each get
+    /// `base_time * 10^(±handicap/2)` per turn, floored at 100 ms.
+    #[arg(long, value_name = "SECONDS", default_value = "1.0")]
+    base_time: f64,
+
     /// Win-probability coefficients B0,B1 such that
-    /// P(sente_win) = sigmoid(B0 + B1 * (sente_rank - gote_rank)).
-    /// Defaults are calibrated from skill.ipynb; refit with
-    /// `benchmark calibrate` if they go stale.
+    /// P(sente_win) = sigmoid(B0 + B1 * sente_advantage), where
+    /// sente_advantage = log10(sente_total_time / gote_total_time). Defaults
+    /// are stale from the old sim-based calibration.
     #[arg(long, value_name = "B0,B1", default_value = "0.3,1.8", value_parser = parse_likelihood)]
     likelihood: Likelihood,
 }
 
-#[derive(Clone, Debug)]
-enum BaselineSpec {
-    Mcts { lo: f64, hi: f64 },
-    Model { lo: f64, hi: f64, path: PathBuf },
-}
-
-#[derive(Clone, Debug)]
-enum SubjectSpec {
-    Mcts { rank: f64 },
-    Model { rank: f64, glob: String },
-}
-
-impl BaselineSpec {
-    fn descriptor(&self) -> String {
-        match self {
-            BaselineSpec::Mcts { lo, hi } => format!("mcts:{lo}-{hi}"),
-            BaselineSpec::Model { lo, hi, path } => {
-                format!("model:{lo}-{hi}:{}", path.display())
-            }
-        }
-    }
-}
-
-fn parse_range(s: &str) -> Result<(f64, f64), String> {
-    let (lo, hi) = s
-        .split_once('-')
-        .ok_or_else(|| format!("expected LO-HI, got {s:?}"))?;
-    let lo: f64 = lo.parse().map_err(|e| format!("bad LO {lo:?}: {e}"))?;
-    let hi: f64 = hi.parse().map_err(|e| format!("bad HI {hi:?}: {e}"))?;
-    if !(lo < hi) {
-        return Err(format!("expected LO < HI, got {lo}-{hi}"));
-    }
-    Ok((lo, hi))
-}
-
-fn parse_baseline(s: &str) -> Result<BaselineSpec, String> {
-    let (kind, rest) = s
-        .split_once(':')
-        .ok_or_else(|| format!("expected KIND:..., got {s:?}"))?;
-    match kind {
-        "mcts" => {
-            let (lo, hi) = parse_range(rest)?;
-            Ok(BaselineSpec::Mcts { lo, hi })
-        }
-        "model" => {
-            let (range, path) = rest
-                .split_once(':')
-                .ok_or_else(|| format!("expected model:LO-HI:PATH, got {s:?}"))?;
-            let (lo, hi) = parse_range(range)?;
-            Ok(BaselineSpec::Model {
-                lo,
-                hi,
-                path: PathBuf::from(path),
-            })
-        }
-        _ => Err(format!("unknown baseline kind {kind:?} (expected mcts or model)")),
-    }
-}
-
-fn parse_subject(s: &str) -> Result<SubjectSpec, String> {
-    let (kind, rest) = s
-        .split_once(':')
-        .ok_or_else(|| format!("expected KIND:..., got {s:?}"))?;
-    match kind {
-        "mcts" => {
-            let rank: f64 = rest
-                .parse()
-                .map_err(|e| format!("bad rank {rest:?}: {e}"))?;
-            Ok(SubjectSpec::Mcts { rank })
-        }
-        "model" => {
-            let (rank, glob) = rest
-                .split_once(':')
-                .ok_or_else(|| format!("expected model:RANK:GLOB, got {s:?}"))?;
-            let rank: f64 = rank
-                .parse()
-                .map_err(|e| format!("bad rank {rank:?}: {e}"))?;
-            Ok(SubjectSpec::Model {
-                rank,
-                glob: glob.to_string(),
-            })
-        }
-        _ => Err(format!("unknown subject kind {kind:?} (expected mcts or model)")),
-    }
-}
-
-/// Coefficients for the win-probability sigmoid:
-/// `P(sente_win) = sigmoid(b0 + b1 * (sente_rank - gote_rank))`.
-#[derive(Copy, Clone, Debug)]
-struct Likelihood {
-    b0: f64,
-    b1: f64,
-}
-
-fn parse_likelihood(s: &str) -> Result<Likelihood, String> {
-    let (b0, b1) = s
-        .split_once(',')
-        .ok_or_else(|| format!("expected B0,B1, got {s:?}"))?;
-    let b0: f64 = b0.parse().map_err(|e| format!("bad B0 {b0:?}: {e}"))?;
-    let b1: f64 = b1.parse().map_err(|e| format!("bad B1 {b1:?}: {e}"))?;
-    Ok(Likelihood { b0, b1 })
-}
-
-/// A resolved player kind: an MCTS searcher or a loaded model. Wraps the only
-/// runtime state that distinguishes a `mcts:` from a `model:` spec, so
-/// downstream code can dispatch through [`Self::player_at`] without
-/// re-matching on the parse-time spec or threading an `Option<CandleModel>`.
-enum Strategy {
-    Mcts,
-    Model(CandleModel),
+/// A baseline or subject in the matchup: an MCTS searcher or a loaded model.
+/// `play()` runs one move respecting the deadline.
+struct Strategy {
+    model: Option<CandleModel>,
+    descriptor: String,
 }
 
 impl Strategy {
-    /// Build a player for one game at the given rank. For `model:` strategies,
-    /// `rank == 0` is treated as pure intuition (no nn-search); otherwise the
-    /// player runs `10^rank` MCTS / nn-search iterations.
-    fn player_at(&self, rank: f64) -> Box<dyn Player + '_> {
-        match self {
-            Strategy::Mcts => Box::new(MctsPlayer::new(10.0f64.powf(rank) as u32)),
-            Strategy::Model(m) => {
-                let sims = 10.0f64.powf(rank) as u32;
-                Box::new(ModelPlayer::new(m, sims))
-            }
+    fn resolve(path: Option<&Path>, device: &CandleDevice) -> io::Result<Self> {
+        match path {
+            None => Ok(Self {
+                model: None,
+                descriptor: "mcts".to_string(),
+            }),
+            Some(p) => Ok(Self {
+                model: Some(load_checkpoint(p, device)?),
+                descriptor: format!("model:{}", p.display()),
+            }),
         }
     }
 
-    fn bench_bps(&self, fast: bool) -> f64 {
-        match self {
-            Strategy::Mcts => bench_mcts_evals(fast),
-            Strategy::Model(m) => bench_model_evals(m, fast),
+    fn play(&self, board: Bitboard, deadline: Instant) -> Bitboard {
+        match &self.model {
+            None => mcts::search(board, board.depth(), MctsDeadline(deadline)).best,
+            Some(m) => {
+                let out = nn_search(m, board, 0.0, 0.0, move |_n: usize| {
+                    Instant::now() < deadline
+                });
+                let i = out
+                    .policy
+                    .iter()
+                    .copied()
+                    .map(|x| x.powi(4))
+                    .sample_weighted(&mut rand::rng())
+                    .unwrap();
+                board.nth_child(i)
+            }
         }
     }
 }
 
-/// A baseline whose range and (optional) model have been resolved from a
-/// [`BaselineSpec`]. Owned for the lifetime of one command invocation.
-struct ResolvedBaseline {
-    strategy: Strategy,
-    lo: f64,
-    hi: f64,
-    descriptor: String,
+fn expand_subjects(paths: &[PathBuf], device: &CandleDevice) -> io::Result<Vec<Strategy>> {
+    if paths.is_empty() {
+        Ok(vec![Strategy::resolve(None, device)?])
+    } else {
+        paths
+            .iter()
+            .map(|p| Strategy::resolve(Some(p), device))
+            .collect()
+    }
 }
 
-impl ResolvedBaseline {
-    fn resolve(spec: &BaselineSpec, device: &CandleDevice) -> io::Result<Self> {
-        let descriptor = spec.descriptor();
-        let (strategy, lo, hi) = match spec {
-            BaselineSpec::Mcts { lo, hi } => (Strategy::Mcts, *lo, *hi),
-            BaselineSpec::Model { lo, hi, path } => {
-                (Strategy::Model(load_checkpoint(path, device)?), *lo, *hi)
-            }
+/// Per-side compute time and outcome of one game.
+struct GameOutcome {
+    sente_win: bool,
+    sente_total: Duration,
+    gote_total: Duration,
+}
+
+const MIN_BUDGET: Duration = Duration::from_millis(100);
+
+/// Split a suggested handicap into per-turn budgets, symmetrically around
+/// `base_time`. Both budgets are floored at 100 ms, so the *effective*
+/// handicap of the game may differ from the suggestion when a side hits the
+/// floor — the rank update uses what actually got played, not what was asked.
+/// Returns `(subject_budget, baseline_budget)`.
+fn budgets_from_handicap(suggested: f64, base_time: f64) -> (Duration, Duration) {
+    let subject_secs = base_time * 10.0f64.powf(-suggested / 2.0);
+    let baseline_secs = base_time * 10.0f64.powf(suggested / 2.0);
+    let subject = Duration::from_secs_f64(subject_secs).max(MIN_BUDGET);
+    let baseline = Duration::from_secs_f64(baseline_secs).max(MIN_BUDGET);
+    (subject, baseline)
+}
+
+fn play_game(
+    sente: &Strategy,
+    gote: &Strategy,
+    sente_budget: Duration,
+    gote_budget: Duration,
+) -> GameOutcome {
+    let mut board = Bitboard::new();
+    let mut sente_total = Duration::ZERO;
+    let mut gote_total = Duration::ZERO;
+    loop {
+        show_game(&board);
+        if let Some(win) = board.win() {
+            return GameOutcome {
+                sente_win: win,
+                sente_total,
+                gote_total,
+            };
+        }
+        let is_sente = board.sente();
+        let (strategy, budget) = if is_sente {
+            (sente, sente_budget)
+        } else {
+            (gote, gote_budget)
         };
-        Ok(Self {
-            strategy,
-            lo,
-            hi,
-            descriptor,
-        })
-    }
-}
-
-/// One subject in the comparison: a strategy at a fixed rank. For `mcts:`
-/// subjects there is exactly one; for `model:` subjects there is one per
-/// glob match.
-struct ResolvedSubject {
-    strategy: Strategy,
-    rank: f64,
-    descriptor: String,
-}
-
-impl ResolvedSubject {
-    fn expand(spec: &SubjectSpec, device: &CandleDevice) -> io::Result<Vec<Self>> {
-        match spec {
-            SubjectSpec::Mcts { rank } => Ok(vec![Self {
-                strategy: Strategy::Mcts,
-                rank: *rank,
-                descriptor: format!("mcts:{rank}"),
-            }]),
-            SubjectSpec::Model {
-                rank,
-                glob: pattern,
-            } => {
-                let paths: Vec<PathBuf> = glob::glob(pattern)
-                    .map_err(|e| io::Error::other(format!("bad glob {pattern:?}: {e}")))?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                if paths.is_empty() {
-                    return Err(io::Error::other(format!(
-                        "subject glob matched no files: {pattern}"
-                    )));
-                }
-                paths
-                    .into_iter()
-                    .map(|p| -> io::Result<Self> {
-                        let descriptor = format!("model:{rank}:{}", p.display());
-                        let model = load_checkpoint(&p, device)?;
-                        Ok(Self {
-                            strategy: Strategy::Model(model),
-                            rank: *rank,
-                            descriptor,
-                        })
-                    })
-                    .collect()
-            }
+        let start = Instant::now();
+        let deadline = start + budget;
+        let next = strategy.play(board, deadline);
+        let elapsed = start.elapsed();
+        if is_sente {
+            sente_total += elapsed;
+        } else {
+            gote_total += elapsed;
         }
+        board = next;
     }
+}
+
+fn show_game(board: &Bitboard) {
+    use hex_table::bb::BitboardPretty;
+    print!("\x1b[s");
+    print!("\x1b[1;1H");
+    for _ in 0..13 {
+        println!("\x1b[K");
+    }
+    print!("\x1b[1;1H{}", BitboardPretty(board));
+    print!("\x1b[u");
+    std::io::stdout().flush().ok();
 }
 
 fn cmd_rank(cmd: &RankCommand, device: &CandleDevice) -> io::Result<()> {
-    let baseline = ResolvedBaseline::resolve(&cmd.baseline, device)?;
-    let subjects = ResolvedSubject::expand(&cmd.subject, device)?;
-    log::info!("expanded subject into {} point(s)", subjects.len());
-
-    let baseline_bps = baseline.strategy.bench_bps(true);
-    // All subjects share the same strategy kind (they came from one
-    // SubjectSpec); for `model:` subjects we also assume all checkpoints share
-    // the same architecture, so benching the first stands in for the rest.
-    let subject_bps = subjects[0].strategy.bench_bps(true);
+    let baseline = Strategy::resolve(cmd.baseline.as_deref(), device)?;
+    let subjects = expand_subjects(&cmd.subject, device)?;
+    log::info!(
+        "baseline {}; {} subject(s)",
+        baseline.descriptor,
+        subjects.len()
+    );
 
     let mut out = cmd
         .output
@@ -433,7 +262,7 @@ fn cmd_rank(cmd: &RankCommand, device: &CandleDevice) -> io::Result<()> {
     if let Some(out) = out.as_mut() {
         writeln!(
             out,
-            "baseline,subject,rank,compute_equiv_rank,mean,stddev,iters,elapsed_seconds"
+            "baseline,subject,handicap,mean,stddev,iters,elapsed_seconds"
         )?;
         out.flush().ok();
     }
@@ -448,13 +277,13 @@ fn cmd_rank(cmd: &RankCommand, device: &CandleDevice) -> io::Result<()> {
     };
 
     for subject in &subjects {
-        let compute_equiv_rank =
-            ((subject.rank + (baseline_bps / subject_bps).log10()) * 100.0).round() / 100.0;
         rank_subject(
             out.as_mut(),
             &baseline,
             subject,
-            compute_equiv_rank,
+            cmd.prior_min,
+            cmd.prior_max,
+            cmd.base_time,
             iters_stop,
             stddev_stop,
             &cmd.likelihood,
@@ -466,59 +295,63 @@ fn cmd_rank(cmd: &RankCommand, device: &CandleDevice) -> io::Result<()> {
 
 fn rank_subject(
     mut out: Option<&mut File>,
-    baseline: &ResolvedBaseline,
-    subject: &ResolvedSubject,
-    compute_equiv_rank: f64,
+    baseline: &Strategy,
+    subject: &Strategy,
+    prior_min: f64,
+    prior_max: f64,
+    base_time: f64,
     iters_stop: Option<usize>,
     stddev_stop: Option<f64>,
     likelihood: &Likelihood,
 ) -> io::Result<()> {
     const RANK_SUBUNITS: f64 = 128.0;
 
-    let ranks_n = ((baseline.hi - baseline.lo) * RANK_SUBUNITS + 1.0).round() as usize;
-    let ranks_xs = Linspace::new(baseline.lo, baseline.hi, ranks_n);
+    let ranks_n = ((prior_max - prior_min) * RANK_SUBUNITS + 1.0).round() as usize;
+    let ranks_xs = Linspace::new(prior_min, prior_max, ranks_n);
+    // Mild normal at handicap = 0 (equal compute), mixed with uniform so the
+    // tails never go to zero.
     let mut ranks = Prior::from_fn(ranks_xs, |x| {
-        let range = baseline.hi - baseline.lo;
-        let mid = baseline.lo + range / 2.0;
-        let uniform = 1.0 / (range) as f64;
-        let normal = x.normal(mid, range / 2.0);
+        let uniform = 1.0 / ranks_n as f64;
+        let normal = x.normal(0.0, 1.0) / RANK_SUBUNITS;
         0.75.lerp(normal, uniform)
     });
 
-    log::info!("ranking subject {} against baseline {}", subject.descriptor, baseline.descriptor,);
+    log::info!(
+        "ranking subject {} against baseline {}",
+        subject.descriptor,
+        baseline.descriptor,
+    );
 
     let start = Instant::now();
 
     for iter in 0usize.. {
-        let rank = ranks.argmax();
+        let handicap = ranks.argmax();
         let stats = ranks.stats();
-
-        let handicap = rank - compute_equiv_rank;
         let stddev = stats.variance.sqrt();
 
         ranks.show(1.0);
         log::info!(
-            "mean={:.2} stddev={:.2} rank={:.2} handicap={:.2}",
+            "iter={iter} mean={:.2} stddev={:.2} handicap={:.2}",
             stats.mean,
             stddev,
-            rank,
             handicap,
         );
 
         let stop = iters_stop.map(|x| x <= iter).unwrap_or(false)
             || stddev_stop.map(|x| stddev <= x).unwrap_or(false);
         if stop {
-            let lo = 10.0f64.powf(handicap - stddev * 2.0);
-            let hi = 10.0f64.powf(handicap + stddev * 2.0);
-            log::info!("subject seems {lo:.2}x-{hi:.2}x baseline strength");
+            log::info!(
+                "subject seems balanced with baseline at handicap {:.2} (95% CI ±{:.2})",
+                handicap,
+                stddev * 2.0,
+            );
             if let Some(out) = out.as_deref_mut() {
                 writeln!(
                     out,
-                    "{},{},{:.2},{:.2},{:.5},{:.5},{},{}",
+                    "{},{},{:.2},{:.5},{:.5},{},{}",
                     baseline.descriptor,
                     subject.descriptor,
-                    rank,
-                    compute_equiv_rank,
+                    handicap,
                     stats.mean,
                     stddev,
                     iter,
@@ -529,183 +362,91 @@ fn rank_subject(
             break;
         }
 
+        let (subject_budget, baseline_budget) = budgets_from_handicap(handicap, base_time);
         let subject_is_sente = iter.is_multiple_of(2);
-        let mut subject_player = subject.strategy.player_at(subject.rank);
-        let mut baseline_player = baseline.strategy.player_at(rank);
-        let sente_win = play_one(&mut *subject_player, &mut *baseline_player, subject_is_sente);
+        let (sente, gote, sente_budget, gote_budget) = if subject_is_sente {
+            (subject, baseline, subject_budget, baseline_budget)
+        } else {
+            (baseline, subject, baseline_budget, subject_budget)
+        };
+        let outcome = play_game(sente, gote, sente_budget, gote_budget);
+
+        // Effective handicap from the baseline's perspective: positive means
+        // baseline actually got more compute than the subject.
+        let baseline_secs = if subject_is_sente {
+            outcome.gote_total.as_secs_f64()
+        } else {
+            outcome.sente_total.as_secs_f64()
+        };
+        let subject_secs = if subject_is_sente {
+            outcome.sente_total.as_secs_f64()
+        } else {
+            outcome.gote_total.as_secs_f64()
+        };
+        let h_eff = (baseline_secs / subject_secs).log10();
+
+        log::info!(
+            "  subject_is_sente={subject_is_sente} h_eff={h_eff:.2} sente_win={}",
+            outcome.sente_win,
+        );
 
         ranks.update(|x| {
-            let sente_relative_rank = if subject_is_sente { x - rank } else { rank - x };
-            let p = p_sente_win(likelihood, sente_relative_rank);
-            match sente_win {
-                true => p,
-                false => 1.0 - p,
-            }
+            // `x` is a candidate balanced handicap (i.e., the handicap at
+            // which the matchup is even). The baseline's actual advantage in
+            // this game over the balanced point is (h_eff - x), translating
+            // into a signed sente_advantage that depends on who was sente.
+            let sente_advantage = if subject_is_sente { x - h_eff } else { h_eff - x };
+            let p = p_sente_win(likelihood, sente_advantage);
+            if outcome.sente_win { p } else { 1.0 - p }
         });
     }
 
     Ok(())
 }
 
-/// Runs `play(sente, gote)` but lets the caller think in terms of who is the
-/// subject vs the baseline. Returns whether sente won.
-fn play_one(subject: &mut dyn Player, baseline: &mut dyn Player, subject_is_sente: bool) -> bool {
-    if subject_is_sente { play(subject, baseline, false) } else { play(baseline, subject, true) }
-}
+/// MCTS monitor that runs the search until [`Instant::now`] reaches the
+/// deadline.
+struct MctsDeadline(Instant);
 
-/// Sample random baseline-rank pairs, play one game per pair, and fit a
-/// logistic regression on the win/loss outcomes. The output is a `(b0, b1)`
-/// pair such that `P(sente_win) = sigmoid(b0 + b1 * (s_rank - g_rank))`.
-#[derive(Parser, Debug)]
-struct CalibrateCommand {
-    /// Baseline strategy spec (defines the rank range sampled from)
-    #[arg(long, value_name = "SPEC", value_parser = parse_baseline)]
-    baseline: BaselineSpec,
-
-    /// Number of games to play
-    #[arg(long, value_name = "N", default_value = "1000")]
-    games: usize,
-
-    /// CSV file to write per-game results to. If omitted, no CSV is written.
-    #[arg(long, value_name = "FILE")]
-    output: Option<PathBuf>,
-}
-
-fn cmd_calibrate(cmd: &CalibrateCommand, device: &CandleDevice) -> io::Result<()> {
-    let baseline = ResolvedBaseline::resolve(&cmd.baseline, device)?;
-    log::info!(
-        "calibrating {}: {} games, rank ∈ [{}, {}]",
-        baseline.descriptor,
-        cmd.games,
-        baseline.lo,
-        baseline.hi,
-    );
-
-    let out_file = cmd
-        .output
-        .as_ref()
-        .map(|p| {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(p)?;
-            writeln!(f, "baseline,sente_rank,gote_rank,sente_win,turns")?;
-            f.flush().ok();
-            io::Result::Ok(f)
-        })
-        .transpose()?;
-    let out = Arc::new(Mutex::new(out_file));
-
-    let pbar = Arc::new(Mutex::new(tqdm::pbar(Some(cmd.games))));
-
-    // The candle Metal backend isn't safe for concurrent forward passes (it
-    // can corrupt internal state and produce NaN policies — and the
-    // CandleModel guard will panic on contended access). For model:
-    // baselines we serialize games into a single-threaded rayon pool. For
-    // mcts: baselines we let rayon use its default thread count.
-    let n_threads = match baseline.strategy {
-        Strategy::Mcts => 0,
-        Strategy::Model(_) => 1,
-    };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(n_threads)
-        .build()
-        .map_err(io::Error::other)?;
-
-    let rows: Vec<(f64, f64, bool)> = pool.install(|| {
-        (0..cmd.games)
-            .into_par_iter()
-            .map(|_| {
-                let s_rank: f64 = rand::random_range(baseline.lo..=baseline.hi);
-                let g_rank: f64 = rand::random_range(baseline.lo..=baseline.hi);
-                let (sente_win, turns) = play_calibrate_game(&baseline.strategy, s_rank, g_rank);
-                if let Some(out) = out.lock().unwrap().as_mut() {
-                    writeln!(
-                        out,
-                        "{},{s_rank},{g_rank},{},{}",
-                        baseline.descriptor, sente_win as u8, turns,
-                    )
-                    .ok();
-                    out.flush().ok();
-                }
-                pbar.lock().unwrap().update(1).ok();
-                (s_rank, g_rank, sente_win)
-            })
-            .collect()
-    });
-    pbar.lock().unwrap().close().ok();
-
-    let xs: Vec<f64> = rows.iter().map(|(s, g, _)| s - g).collect();
-    let ys: Vec<f64> = rows.iter().map(|(_, _, w)| *w as u8 as f64).collect();
-    let (b0, b1) = fit_logistic(&xs, &ys);
-    log::info!("logistic regression: P(sente_win) = sigmoid({b0:.4} + {b1:.4} * rank_diff)");
-    println!();
-    println!("p_sente_win(diff) = sigmoid({b0:.4} + {b1:.4} * diff)");
-    println!("  b0 = {b0:.6}");
-    println!("  b1 = {b1:.6}");
-
-    Ok(())
-}
-
-fn play_calibrate_game(strategy: &Strategy, s_rank: f64, g_rank: f64) -> (bool, usize) {
-    let sente = strategy.player_at(s_rank);
-    let gote = strategy.player_at(g_rank);
-    let mut board = Bitboard::new();
-    for turn in 0.. {
-        if let Some(win) = board.win() {
-            return (win, turn);
-        }
-        board = match board.sente() {
-            true => sente.play(board),
-            false => gote.play(board),
-        };
-    }
-    unreachable!()
-}
-
-/// Newton-Raphson fit of a 2-parameter logistic regression:
-/// `P(y=1 | x) = sigmoid(b0 + b1 * x)`. Returns `(b0, b1)`. Unregularized
-/// (maximum-likelihood); converges in ~5-10 iterations for typical data.
-fn fit_logistic(xs: &[f64], ys: &[f64]) -> (f64, f64) {
-    assert_eq!(xs.len(), ys.len());
-    let mut b0 = 0.0;
-    let mut b1 = 0.0;
-    for _ in 0..100 {
-        let mut g0 = 0.0;
-        let mut g1 = 0.0;
-        let mut h00 = 0.0;
-        let mut h01 = 0.0;
-        let mut h11 = 0.0;
-        for i in 0..xs.len() {
-            let z = b0 + b1 * xs[i];
-            let p = 1.0 / (1.0 + (-z).exp());
-            let err = p - ys[i];
-            g0 += err;
-            g1 += err * xs[i];
-            let w = p * (1.0 - p);
-            h00 += w;
-            h01 += w * xs[i];
-            h11 += w * xs[i] * xs[i];
-        }
-        let det = h00 * h11 - h01 * h01;
-        if det.abs() < 1e-12 {
-            break;
-        }
-        let d0 = (h11 * g0 - h01 * g1) / det;
-        let d1 = (-h01 * g0 + h00 * g1) / det;
-        b0 -= d0;
-        b1 -= d1;
-        if d0.abs() < 1e-8 && d1.abs() < 1e-8 {
-            break;
+impl<S> MctsMonitor<S> for MctsDeadline {
+    fn defer(&mut self, _stats: &MctsStats<S>) -> ControlFlow<()> {
+        use ControlFlow::*;
+        if Instant::now() < self.0 {
+            Continue(())
+        } else {
+            Break(())
         }
     }
-    (b0, b1)
 }
 
-fn p_sente_win(likelihood: &Likelihood, sente_relative_rank: f64) -> f64 {
-    (likelihood.b0 + likelihood.b1 * sente_relative_rank).sigmoid()
+// ============================================================================
+// p_sente_win and likelihood
+// ============================================================================
+
+fn p_sente_win(likelihood: &Likelihood, sente_advantage: f64) -> f64 {
+    (likelihood.b0 + likelihood.b1 * sente_advantage).sigmoid()
 }
+
+/// Coefficients for the win-probability sigmoid:
+/// `P(sente_win) = sigmoid(b0 + b1 * sente_advantage)`.
+#[derive(Copy, Clone, Debug)]
+struct Likelihood {
+    b0: f64,
+    b1: f64,
+}
+
+fn parse_likelihood(s: &str) -> Result<Likelihood, String> {
+    let (b0, b1) = s
+        .split_once(',')
+        .ok_or_else(|| format!("expected B0,B1, got {s:?}"))?;
+    let b0: f64 = b0.parse().map_err(|e| format!("bad B0 {b0:?}: {e}"))?;
+    let b1: f64 = b1.parse().map_err(|e| format!("bad B1 {b1:?}: {e}"))?;
+    Ok(Likelihood { b0, b1 })
+}
+
+// ============================================================================
+// Linspace, Prior — discrete prior on a 1D grid
+// ============================================================================
 
 #[derive(Copy, Clone, Debug)]
 struct Linspace {
@@ -724,7 +465,7 @@ impl Linspace {
     }
 }
 
-/// A discrete prior distribution
+/// A discrete prior distribution.
 #[derive(Clone)]
 struct Prior {
     xs: Linspace,
@@ -845,206 +586,9 @@ impl Prior {
     }
 }
 
-struct MctsSims(u32);
-
-impl<S> MctsMonitor<S> for MctsSims {
-    fn defer(&mut self, stats: &MctsStats<S>) -> ControlFlow<()> {
-        use ControlFlow::*;
-        match stats.num_sims < self.0 {
-            true => Continue(()),
-            false => Break(()),
-        }
-    }
-}
-
-fn bench_model_evals(model: &CandleModel, fast: bool) -> f64 {
-    let board = Bitboard::new();
-
-    log::info!("benchmarking model evals");
-
-    let dur = match fast {
-        true => Duration::from_secs(1),
-        false => Duration::from_secs(30),
-    };
-    log::info!("warming up for {dur:?}");
-    let start = Instant::now();
-    while start.elapsed() < dur {
-        std::hint::black_box(model.call(board));
-    }
-
-    let dur = match fast {
-        true => Duration::from_secs(1),
-        false => Duration::from_secs(5),
-    };
-    log::info!("counting evals in {dur:?}");
-    let mut count = 0;
-    let start = Instant::now();
-    while start.elapsed() < dur {
-        std::hint::black_box(model.call(board));
-        count += 1;
-    }
-
-    let res = count as f64 / dur.as_secs_f64();
-    log::info!("result: {} evals per time", res);
-    res
-}
-
-fn bench_mcts_evals(fast: bool) -> f64 {
-    let board = Bitboard::new();
-
-    log::info!("benchmarking mcts evals");
-
-    let dur = match fast {
-        true => Duration::from_secs(1),
-        false => Duration::from_secs(5),
-    };
-    log::info!("counting evals in {dur:?}");
-    let mut count = 0;
-    let start = Instant::now();
-    while start.elapsed() < dur {
-        std::hint::black_box(mcts::search(board, 0, MctsSims(10000)));
-        count += 10000;
-    }
-
-    let res = count as f64 / dur.as_secs_f64();
-    log::info!("result: {} evals per time", res);
-    res
-}
-
-trait Player {
-    fn record_win(&mut self, sente: bool);
-    fn play(&self, board: Bitboard) -> Bitboard;
-}
-
-struct ModelPlayer<'a> {
-    wins: usize,
-    wins_as_sente: usize,
-    wins_as_gote: usize,
-    model: &'a CandleModel,
-    /// Number of nn-MCTS iterations per move. `0` means pure intuition: take
-    /// the policy argmax with no tree search.
-    sims: u32,
-}
-
-impl<'a> ModelPlayer<'a> {
-    fn new(model: &'a CandleModel, sims: u32) -> Self {
-        Self {
-            wins: 0,
-            wins_as_sente: 0,
-            wins_as_gote: 0,
-            model,
-            sims,
-        }
-    }
-}
-
-impl<'a> Player for ModelPlayer<'a> {
-    fn record_win(&mut self, sente: bool) {
-        self.wins += 1;
-        match sente {
-            true => self.wins_as_sente += 1,
-            false => self.wins_as_gote += 1,
-        }
-    }
-
-    fn play(&self, board: Bitboard) -> Bitboard {
-        // we use sample here to inject some randomness into the rating system
-        if self.sims <= 2 {
-            let out = self.model.call(board);
-            let sample = out
-                .policy
-                .iter()
-                .enumerate()
-                .map(|(i, x)| if board.nth_child_valid(i) { *x } else { 0.0 })
-                .sample_weighted(&mut rand::rng())
-                .expect("no move");
-            board.nth_child(sample)
-        } else {
-            let target = self.sims as usize;
-            nn_search(self.model, board, 0.0, 0.0, |n: usize| n < target).board_sample
-        }
-    }
-}
-
-struct MctsPlayer {
-    wins: usize,
-    wins_as_sente: usize,
-    wins_as_gote: usize,
-    sims: u32,
-}
-
-impl MctsPlayer {
-    fn new(sims: u32) -> Self {
-        Self {
-            wins: 0,
-            wins_as_sente: 0,
-            wins_as_gote: 0,
-            sims,
-        }
-    }
-}
-
-impl Player for MctsPlayer {
-    fn record_win(&mut self, sente: bool) {
-        self.wins += 1;
-        match sente {
-            true => self.wins_as_sente += 1,
-            false => self.wins_as_gote += 1,
-        }
-    }
-
-    fn play(&self, board: Bitboard) -> Bitboard {
-        mcts::search(board, board.depth(), MctsSims(self.sims)).best
-    }
-}
-
-fn play(sente: &mut dyn Player, gote: &mut dyn Player, transpose: bool) -> bool {
-    let mut board = Bitboard::new();
-    loop {
-        if let Some(win) = board.win() {
-            println!(
-                "{}",
-                hex_table::bb::BitboardPretty(&if transpose { board.transpose() } else { board })
-            );
-            match win {
-                true => sente.record_win(true),
-                false => gote.record_win(false),
-            }
-            return win;
-        }
-        board = match board.sente() {
-            true => sente.play(board),
-            false => gote.play(board),
-        };
-    }
-}
-
-fn make_them_fight(model: &CandleModel, games: usize, mcts_sims: u32) -> (f64, usize, usize) {
-    let mut model_player = ModelPlayer {
-        wins: 0,
-        wins_as_sente: 0,
-        wins_as_gote: 0,
-        model,
-        sims: 0,
-    };
-    let mut mcts_player = MctsPlayer {
-        wins: 0,
-        wins_as_sente: 0,
-        wins_as_gote: 0,
-        sims: mcts_sims,
-    };
-
-    for i in (0..games).tqdm() {
-        match i.is_multiple_of(2) {
-            true => play(&mut model_player, &mut mcts_player, false),
-            false => play(&mut mcts_player, &mut model_player, true),
-        };
-    }
-
-    let total = (model_player.wins + mcts_player.wins) as f64;
-    let win_rate = model_player.wins as f64 / total;
-    (win_rate, model_player.wins_as_sente, model_player.wins_as_gote)
-}
+// ============================================================================
+// FloatExt
+// ============================================================================
 
 trait FloatExt {
     /// Calculate N(mu, sig^2)
@@ -1078,3 +622,120 @@ impl FloatExt for f64 {
         (self - y0) / (y1 - y0)
     }
 }
+
+// ============================================================================
+// calibrate (commented out pending redesign for time-based players)
+// ============================================================================
+
+/*
+
+// The calibrate subcommand collected random rank pairs of MCTS-vs-MCTS games
+// and fit a logistic regression to derive the (b0, b1) coefficients used by
+// p_sente_win. The rank-based formulation is obsolete — the new design wants
+// the regression in terms of log10(time-ratio) rather than rank diff. Left
+// here as a reference until we redesign it.
+
+#[derive(Parser, Debug)]
+struct CalibrateCommand {
+    #[arg(long, value_name = "SPEC", value_parser = parse_baseline)]
+    baseline: BaselineSpec,
+    #[arg(long, value_name = "N", default_value = "1000")]
+    games: usize,
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
+fn cmd_calibrate(cmd: &CalibrateCommand, device: &CandleDevice) -> io::Result<()> {
+    let baseline = ResolvedBaseline::resolve(&cmd.baseline, device)?;
+    log::info!(
+        "calibrating {}: {} games, rank ∈ [{}, {}]",
+        baseline.descriptor, cmd.games, baseline.lo, baseline.hi,
+    );
+
+    let out_file = cmd.output.as_ref().map(|p| {
+        let mut f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(p)?;
+        writeln!(f, "baseline,sente_rank,gote_rank,sente_win,turns")?;
+        f.flush().ok();
+        io::Result::Ok(f)
+    }).transpose()?;
+    let out = Arc::new(Mutex::new(out_file));
+
+    let pbar = Arc::new(Mutex::new(tqdm::pbar(Some(cmd.games))));
+    let n_threads = match baseline.strategy {
+        Strategy::Mcts => 0,
+        Strategy::Model(_) => 1,
+    };
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().map_err(io::Error::other)?;
+
+    let rows: Vec<(f64, f64, bool)> = pool.install(|| {
+        (0..cmd.games).into_par_iter().map(|_| {
+            let s_rank: f64 = rand::random_range(baseline.lo..=baseline.hi);
+            let g_rank: f64 = rand::random_range(baseline.lo..=baseline.hi);
+            let (sente_win, turns) = play_calibrate_game(&baseline.strategy, s_rank, g_rank);
+            if let Some(out) = out.lock().unwrap().as_mut() {
+                writeln!(out, "{},{s_rank},{g_rank},{},{}", baseline.descriptor, sente_win as u8, turns).ok();
+                out.flush().ok();
+            }
+            pbar.lock().unwrap().update(1).ok();
+            (s_rank, g_rank, sente_win)
+        }).collect()
+    });
+    pbar.lock().unwrap().close().ok();
+
+    let xs: Vec<f64> = rows.iter().map(|(s, g, _)| s - g).collect();
+    let ys: Vec<f64> = rows.iter().map(|(_, _, w)| *w as u8 as f64).collect();
+    let (b0, b1) = fit_logistic(&xs, &ys);
+    println!("p_sente_win(diff) = sigmoid({b0:.4} + {b1:.4} * diff)");
+    println!("  b0 = {b0:.6}");
+    println!("  b1 = {b1:.6}");
+    Ok(())
+}
+
+fn play_calibrate_game(strategy: &Strategy, s_rank: f64, g_rank: f64) -> (bool, usize) {
+    let sente = strategy.player_at(s_rank);
+    let gote = strategy.player_at(g_rank);
+    let mut board = Bitboard::new();
+    for turn in 0.. {
+        if let Some(win) = board.win() { return (win, turn); }
+        board = match board.sente() {
+            true => sente.play(board),
+            false => gote.play(board),
+        };
+    }
+    unreachable!()
+}
+
+/// Newton-Raphson fit of a 2-parameter logistic regression.
+fn fit_logistic(xs: &[f64], ys: &[f64]) -> (f64, f64) {
+    assert_eq!(xs.len(), ys.len());
+    let mut b0 = 0.0;
+    let mut b1 = 0.0;
+    for _ in 0..100 {
+        let mut g0 = 0.0;
+        let mut g1 = 0.0;
+        let mut h00 = 0.0;
+        let mut h01 = 0.0;
+        let mut h11 = 0.0;
+        for i in 0..xs.len() {
+            let z = b0 + b1 * xs[i];
+            let p = 1.0 / (1.0 + (-z).exp());
+            let err = p - ys[i];
+            g0 += err;
+            g1 += err * xs[i];
+            let w = p * (1.0 - p);
+            h00 += w;
+            h01 += w * xs[i];
+            h11 += w * xs[i] * xs[i];
+        }
+        let det = h00 * h11 - h01 * h01;
+        if det.abs() < 1e-12 { break; }
+        let d0 = (h11 * g0 - h01 * g1) / det;
+        let d1 = (-h01 * g0 + h00 * g1) / det;
+        b0 -= d0;
+        b1 -= d1;
+        if d0.abs() < 1e-8 && d1.abs() < 1e-8 { break; }
+    }
+    (b0, b1)
+}
+
+*/

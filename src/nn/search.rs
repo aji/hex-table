@@ -153,15 +153,22 @@ impl Edge {
 
     fn puct(&self, invert_value: bool, parent_value: f32, n: f32) -> Finite {
         let f = if invert_value { -1.0 } else { 1.0 };
-        let v = if self.visits == 0 { parent_value - f * FPU_PENALTY } else { self.mean_value };
+        let v = if self.visits == 0 {
+            parent_value - f * FPU_PENALTY
+        } else {
+            self.mean_value
+        };
         let puct = f * v + PUCT * self.prior * (1.0 + n).sqrt() / (1.0 + self.visits as f32);
         (puct as f64).into()
     }
 
     fn step<E: Evaluator>(&mut self, eval: &E, value_decay: f32, board: Bitboard) -> Backprop {
-        let backprop =
-            self.child
-                .step(eval, value_decay, board.nth_child(self.action), self.mean_value);
+        let backprop = self.child.step(
+            eval,
+            value_decay,
+            board.nth_child(self.action),
+            self.mean_value,
+        );
 
         self.visits += 1;
         self.total_value += backprop.value;
@@ -195,9 +202,12 @@ impl Tree {
     }
 
     fn step<E: Evaluator>(&mut self, eval: &E) {
-        let backprop =
-            self.root
-                .step(eval, self.value_decay, self.root_board, self.root_mean_value);
+        let backprop = self.root.step(
+            eval,
+            self.value_decay,
+            self.root_board,
+            self.root_mean_value,
+        );
 
         if self.root_visits == 0
             && self.dirichlet > 0.0

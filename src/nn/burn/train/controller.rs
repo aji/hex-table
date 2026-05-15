@@ -113,7 +113,10 @@ impl ControllerClient {
         model_id: &str,
         etag: Option<&str>,
     ) -> TrainResult<FetchModelData> {
-        let url = format!("{}/api/model/{}/params/latest", self.controller_url, model_id);
+        let url = format!(
+            "{}/api/model/{}/params/latest",
+            self.controller_url, model_id
+        );
         let res = DEFAULT_RETRY.attempt(
             || {
                 let mut req = self.client.get(&url);
@@ -147,9 +150,14 @@ impl ControllerClient {
             Some(n) => format!("?start={n}"),
             None => "".into(),
         };
-        let url = format!("{}/api/model/{}/positions{}", self.controller_url, model_id, query);
-        let res = DEFAULT_RETRY
-            .attempt(|| Ok(self.client.get(&url).send()?), TrainError::continue_if_retryable)?;
+        let url = format!(
+            "{}/api/model/{}/positions{}",
+            self.controller_url, model_id, query
+        );
+        let res = DEFAULT_RETRY.attempt(
+            || Ok(self.client.get(&url).send()?),
+            TrainError::continue_if_retryable,
+        )?;
 
         let cursor = res
             .headers()
@@ -245,7 +253,11 @@ impl PositionsBuffer {
         }
 
         let n = data.len() / SERIALIZED_LEN;
-        log::info!("got {n} new positions. total={}, cursor={:?}", self.items.len(), self.cursor);
+        log::info!(
+            "got {n} new positions. total={}, cursor={:?}",
+            self.items.len(),
+            self.cursor
+        );
         Ok(n)
     }
 
@@ -412,9 +424,13 @@ impl ModelInfo {
             Some(it) => format!("{it:.8}"),
             None => String::new(),
         };
-        write!(self.log, "{log_time},{name},{log_iters},{log_loss},{}\n", self.positions.len())
-            .inspect_err(|e| log::warn!("failed to write to log: {e}"))
-            .ok();
+        write!(
+            self.log,
+            "{log_time},{name},{log_iters},{log_loss},{}\n",
+            self.positions.len()
+        )
+        .inspect_err(|e| log::warn!("failed to write to log: {e}"))
+        .ok();
         self.log
             .flush()
             .inspect_err(|e| log::warn!("failed to flush log: {e}"))
@@ -634,16 +650,21 @@ pub async fn main() {
         .route("/api/model", post(http_api_post_model))
         .route("/api/model/{id}/config", get(http_api_get_model_config))
         .route("/api/model/{id}/params", post(http_api_post_model_params))
-        .route("/api/model/{id}/params/latest", get(http_api_get_model_params_latest))
+        .route(
+            "/api/model/{id}/params/latest",
+            get(http_api_get_model_params_latest),
+        )
         .route("/api/model/{id}/positions", post(http_api_post_positions))
         .route("/api/model/{id}/positions", get(http_api_get_positions))
         .with_state(AppState::new(cf.clone()).unwrap())
-        .layer(axum::middleware::from_fn(async |req: Request, next: Next| {
-            let msg = format!("{} {}", req.method(), req.uri());
-            let res = next.run(req).await;
-            log::info!("{msg} - {}", res.status());
-            res
-        }));
+        .layer(axum::middleware::from_fn(
+            async |req: Request, next: Next| {
+                let msg = format!("{} {}", req.method(), req.uri());
+                let res = next.run(req).await;
+                log::info!("{msg} - {}", res.status());
+                res
+            },
+        ));
 
     let addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, cf.port).into();
     log::info!("listening on {addr:?}");

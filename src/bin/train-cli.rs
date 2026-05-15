@@ -191,13 +191,20 @@ fn play(
     loop {
         if let Some(win) = board.win() {
             println!("({:?})\n{}", start.elapsed(), BitboardPretty(&board));
-            println!("({:?}) {} wins", start.elapsed(), if win { "sente" } else { "gote" });
+            println!(
+                "({:?}) {} wins",
+                start.elapsed(),
+                if win { "sente" } else { "gote" }
+            );
             return;
         }
         if iters > 0 {
             println!("({:?})\n{}", start.elapsed(), BitboardPretty(&board));
             let out = search(&model, board, 0.0, value_decay, |n: usize| {
-                print!("\x1b[G\x1b[K{n}/{iters} {:.1}%", n as f64 * 100.0 / iters as f64);
+                print!(
+                    "\x1b[G\x1b[K{n}/{iters} {:.1}%",
+                    n as f64 * 100.0 / iters as f64
+                );
                 std::io::stdout().flush().ok();
                 n < iters
             });

@@ -464,7 +464,10 @@ impl ModelConfig {
     }
 
     pub fn id(&self) -> String {
-        format!("v0-{}-{}-{}", self.conv_layers, self.conv_channels, self.value_hidden)
+        format!(
+            "v0-{}-{}-{}",
+            self.conv_layers, self.conv_channels, self.value_hidden
+        )
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {

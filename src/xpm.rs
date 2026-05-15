@@ -14,7 +14,10 @@ const DIGITS: LazyLock<Vec<char>> = LazyLock::new(|| "abcdefghijklmnop".chars().
 impl XpmImage {
     pub fn new(width: usize, height: usize, palette: Vec<(u8, u8, u8)>) -> XpmImage {
         assert!(!palette.is_empty(), "palette must have at least one color");
-        assert!(palette.len() <= 16, "palette cannot have more than 16 colors");
+        assert!(
+            palette.len() <= 16,
+            "palette cannot have more than 16 colors"
+        );
         XpmImage {
             palette,
             rows: height,
@@ -35,7 +38,13 @@ impl fmt::Display for XpmImage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "/* XPM */")?;
         writeln!(f, "static char * IMAGE[] = {{")?;
-        writeln!(f, "\"{} {} {} 1\",", self.cols, self.rows, self.palette.len())?;
+        writeln!(
+            f,
+            "\"{} {} {} 1\",",
+            self.cols,
+            self.rows,
+            self.palette.len()
+        )?;
         for (i, (r, g, b)) in self.palette.iter().enumerate() {
             writeln!(f, "\"{} c #{r:02x}{g:02x}{b:02x}\",", DIGITS[i])?;
         }

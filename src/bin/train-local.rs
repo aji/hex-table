@@ -22,7 +22,9 @@ use hex_table::{
     mcts,
     nn::{
         burn::{
-            model::{BurnModel, BurnModelRecord, BurnModelRecordItem, ModelConfig, positions_to_input},
+            model::{
+                BurnModel, BurnModelRecord, BurnModelRecordItem, ModelConfig, positions_to_input,
+            },
             train::positions::Position,
         },
         search::{EvalRequest, EvalResult, Evaluator, search},
@@ -211,10 +213,7 @@ fn evaluator(ctx: Context, inbox: Receiver<EvaluatorMsg>) {
 
         let model = model.valid();
         let (reqs, rets): (Vec<_>, Vec<_>) = std::mem::take(&mut pending).into_iter().unzip();
-        for (ret, res) in rets
-            .into_iter()
-            .zip(model.eval_batch(reqs).into_iter())
-        {
+        for (ret, res) in rets.into_iter().zip(model.eval_batch(reqs).into_iter()) {
             ret.send(res).unwrap();
         }
     }
@@ -225,7 +224,11 @@ fn prefill(ctx: Context) {
     let mut last_print = Instant::now();
     for i in 0..n {
         if last_print.elapsed().as_millis() > 200 {
-            println!("n={} prefill {}% complete", ctx.num_positions(), i * 100 / n);
+            println!(
+                "n={} prefill {}% complete",
+                ctx.num_positions(),
+                i * 100 / n
+            );
             last_print = Instant::now();
         }
         ctx.play(|board| {
@@ -247,12 +250,15 @@ fn self_play(idx: usize, ctx: Context) {
         ctx.play(|board| {
             let depth = board.depth();
             if depth % 10 == 0 {
-                println!("n={} self play {idx:03} move {:3}", ctx.num_positions(), board.depth());
+                println!(
+                    "n={} self play {idx:03} move {:3}",
+                    ctx.num_positions(),
+                    board.depth()
+                );
             }
             let limit = 600 + idx;
             let eval = BatchEvaluator(&ctx);
-            let out =
-                search(&eval, board, SELF_PLAY_DIRICHLET, 0.0, |n: usize| n < limit);
+            let out = search(&eval, board, SELF_PLAY_DIRICHLET, 0.0, |n: usize| n < limit);
             let (board, value) = if depth < SELF_PLAY_SAMPLE_THRESHOLD {
                 (out.board_sample, out.value_sample)
             } else {

@@ -73,7 +73,10 @@ impl AppConfig {
             total_iters: Arc::new(AtomicUsize::new(0)),
         };
         log::info!("HEX_TRAIN_MODEL_ID={}", cf.model_id);
-        log::info!("HEX_TRAIN_OPTIMIZER_UPLOAD_INTERVAL={}", cf.upload_interval_secs);
+        log::info!(
+            "HEX_TRAIN_OPTIMIZER_UPLOAD_INTERVAL={}",
+            cf.upload_interval_secs
+        );
         log::info!("HEX_TRAIN_OPTIMIZER_BATCH_SIZE={}", cf.batch_size);
         log::info!("HEX_TRAIN_OPTIMIZER_MOMENTUM={}", cf.momentum);
         log::info!("HEX_TRAIN_OPTIMIZER_LEARNING_RATE={}", cf.learning_rate);

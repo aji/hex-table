@@ -112,7 +112,10 @@ fn tensor_from_burn(p: &BurnTensorData, device: &Device) -> Result<Tensor> {
     }
     let raw = p.bytes.as_ref();
     if raw.len() % 4 != 0 {
-        return Err(Error::Msg(format!("byte length {} not a multiple of 4", raw.len())));
+        return Err(Error::Msg(format!(
+            "byte length {} not a multiple of 4",
+            raw.len()
+        )));
     }
     let values: Vec<f32> = raw
         .chunks_exact(4)
@@ -132,8 +135,16 @@ fn populate_hex_conv(
     burn: &BurnHexConv,
     device: &Device,
 ) -> Result<()> {
-    insert(map, format!("{prefix}.weight"), tensor_from_burn(&burn.kernel.param, device)?)?;
-    insert(map, format!("{prefix}.bias"), tensor_from_burn(&burn.bias.param, device)?)?;
+    insert(
+        map,
+        format!("{prefix}.weight"),
+        tensor_from_burn(&burn.kernel.param, device)?,
+    )?;
+    insert(
+        map,
+        format!("{prefix}.bias"),
+        tensor_from_burn(&burn.bias.param, device)?,
+    )?;
     Ok(())
 }
 
@@ -143,8 +154,16 @@ fn populate_conv2d(
     burn: &BurnConv2d,
     device: &Device,
 ) -> Result<()> {
-    insert(map, format!("{prefix}.weight"), tensor_from_burn(&burn.weight.param, device)?)?;
-    insert(map, format!("{prefix}.bias"), tensor_from_burn(&burn.bias.param, device)?)?;
+    insert(
+        map,
+        format!("{prefix}.weight"),
+        tensor_from_burn(&burn.weight.param, device)?,
+    )?;
+    insert(
+        map,
+        format!("{prefix}.bias"),
+        tensor_from_burn(&burn.bias.param, device)?,
+    )?;
     Ok(())
 }
 
@@ -154,8 +173,16 @@ fn populate_batch_norm(
     burn: &BurnBatchNorm,
     device: &Device,
 ) -> Result<()> {
-    insert(map, format!("{prefix}.weight"), tensor_from_burn(&burn.gamma.param, device)?)?;
-    insert(map, format!("{prefix}.bias"), tensor_from_burn(&burn.beta.param, device)?)?;
+    insert(
+        map,
+        format!("{prefix}.weight"),
+        tensor_from_burn(&burn.gamma.param, device)?,
+    )?;
+    insert(
+        map,
+        format!("{prefix}.bias"),
+        tensor_from_burn(&burn.beta.param, device)?,
+    )?;
     insert(
         map,
         format!("{prefix}.running_mean"),
@@ -176,9 +203,15 @@ fn populate_linear(
     device: &Device,
 ) -> Result<()> {
     // Burn stores linear weights as [in, out]; candle expects [out, in].
-    let weight = tensor_from_burn(&burn.weight.param, device)?.t()?.contiguous()?;
+    let weight = tensor_from_burn(&burn.weight.param, device)?
+        .t()?
+        .contiguous()?;
     insert(map, format!("{prefix}.weight"), weight)?;
-    insert(map, format!("{prefix}.bias"), tensor_from_burn(&burn.bias.param, device)?)?;
+    insert(
+        map,
+        format!("{prefix}.bias"),
+        tensor_from_burn(&burn.bias.param, device)?,
+    )?;
     Ok(())
 }
 
@@ -221,6 +254,12 @@ impl CandleModel {
             populate_linear(&mut data, "value.linear1", &item.value.linear1, dev)?;
         }
 
-        Ok(CandleModel::build(conv_layers, conv_channels, value_hidden, device, varmap))
+        Ok(CandleModel::build(
+            conv_layers,
+            conv_channels,
+            value_hidden,
+            device,
+            varmap,
+        ))
     }
 }

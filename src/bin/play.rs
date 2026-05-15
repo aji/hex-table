@@ -1,3 +1,4 @@
+use clap::Parser;
 use ggez::{
     Context, ContextBuilder, GameError, GameResult,
     conf::WindowMode,
@@ -10,6 +11,84 @@ use hex_table::{
     agent::{Agent, ThinkHandle, mcts_thinking_task},
     bb::{Bitboard, BitboardPretty},
 };
+
+#[cfg(feature = "candle")]
+use std::{path::PathBuf, sync::Arc, time::Instant};
+
+#[cfg(feature = "candle")]
+use hex_table::{
+    agent::AgentThinker,
+    nn::{
+        candle::model::{CandleDevice, CandleModel},
+        search::search as nn_search,
+    },
+    util::IteratorExt,
+};
+
+#[derive(Parser, Debug)]
+struct Cli {
+    /// Path to a candle checkpoint. If set, the opponent uses the loaded
+    /// model; otherwise an MCTS bot is used.
+    #[cfg(feature = "candle")]
+    #[arg(long, value_name = "PATH")]
+    model: Option<PathBuf>,
+}
+
+enum Bot {
+    Mcts(Agent<fn(ThinkHandle)>),
+    #[cfg(feature = "candle")]
+    Nn(Agent<NnThinker>),
+}
+
+impl Bot {
+    fn think(&self, board: Bitboard, turn: usize) -> ThinkHandle {
+        match self {
+            Bot::Mcts(a) => a.think(board, turn),
+            #[cfg(feature = "candle")]
+            Bot::Nn(a) => a.think(board, turn),
+        }
+    }
+}
+
+#[cfg(feature = "candle")]
+#[derive(Clone)]
+struct NnThinker {
+    model: Arc<CandleModel>,
+}
+
+#[cfg(feature = "candle")]
+impl AgentThinker for NnThinker {
+    fn think(self, handle: ThinkHandle) {
+        nn_thinking_task(&self.model, handle);
+    }
+}
+
+#[cfg(feature = "candle")]
+fn nn_thinking_task(model: &CandleModel, task: ThinkHandle) {
+    let board = task.data().board;
+    let start = Instant::now();
+    let out = nn_search(model, board, 0.0, 0.0, {
+        let task = task.clone();
+        move |n: usize| {
+            let elapsed = start.elapsed();
+            let aborted = {
+                let mut data = task.data();
+                data.message =
+                    Some(format!("{:>8} sims {:>7.1?}", n, elapsed));
+                data.aborted
+            };
+            !aborted && elapsed.as_secs() < 2
+        }
+    });
+    let i = out
+        .policy
+        .iter()
+        .copied()
+        .map(|x| x.powi(4))
+        .sample_weighted(&mut rand::rng())
+        .unwrap();
+    task.data().result = Some(board.nth_child(i));
+}
 
 #[derive(Debug)]
 struct BoardGeom {
@@ -88,7 +167,7 @@ impl BoardGeom {
 }
 
 struct MainState {
-    bot: Agent<fn(ThinkHandle)>,
+    bot: Bot,
     bot_task: Option<ThinkHandle>,
     bot_message: String,
     cursor: Option<(usize, usize)>,
@@ -102,7 +181,7 @@ struct MainState {
 }
 
 impl MainState {
-    fn new(ctx: &mut Context) -> GameResult<MainState> {
+    fn new(ctx: &mut Context, bot: Bot) -> GameResult<MainState> {
         let rad = (std::f32::consts::TAU / 12.0).cos() * 2.0 / 3.0;
         let hex_points: Vec<Vec2> = (0..6)
             .map(|i| {
@@ -138,7 +217,7 @@ impl MainState {
         ));
 
         Ok(MainState {
-            bot: Agent::new(mcts_thinking_task),
+            bot,
             bot_task: None,
             bot_message: "Idle".into(),
             cursor: None,
@@ -317,9 +396,33 @@ impl EventHandler<Context, GameError> for MainState {
 }
 
 fn main() -> GameResult {
+    let cli = Cli::parse();
+    let bot = build_bot(&cli)?;
+
     let cb = ContextBuilder::new("github.com/aji/hex-table", "Hex")
         .window_mode(WindowMode::default().dimensions(WIDTH, HEIGHT));
     let (mut ctx, ev) = cb.build()?;
-    let state = MainState::new(&mut ctx)?;
+    let state = MainState::new(&mut ctx, bot)?;
     ggez::event::run(ctx, ev, state)
+}
+
+#[cfg(feature = "candle")]
+fn build_bot(cli: &Cli) -> GameResult<Bot> {
+    if let Some(path) = cli.model.as_deref() {
+        let device = CandleDevice::default();
+        println!("loading model {} on {:?}", path.display(), device);
+        let bytes = std::fs::read(path)?;
+        let model = CandleModel::load_burn(&bytes, &device)
+            .map_err(|e| GameError::CustomError(e.to_string()))?;
+        Ok(Bot::Nn(Agent::new(NnThinker {
+            model: Arc::new(model),
+        })))
+    } else {
+        Ok(Bot::Mcts(Agent::new(mcts_thinking_task)))
+    }
+}
+
+#[cfg(not(feature = "candle"))]
+fn build_bot(_cli: &Cli) -> GameResult<Bot> {
+    Ok(Bot::Mcts(Agent::new(mcts_thinking_task)))
 }

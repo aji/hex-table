@@ -148,10 +148,7 @@ fn evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
         assert_eq!(reqs.len(), rets.len());
         let reqs = std::mem::take(&mut reqs);
         let rets = std::mem::take(&mut rets);
-        for (ret, res) in rets
-            .into_iter()
-            .zip(model.eval_batch(reqs).into_iter())
-        {
+        for (ret, res) in rets.into_iter().zip(model.eval_batch(reqs).into_iter()) {
             ret.send(res).unwrap();
         }
     }
@@ -202,7 +199,10 @@ fn uploader(cf: AppConfig, inbox: Receiver<UploaderMsg>) {
             continue;
         }
 
-        log::info!("flushing uploader buffer ({} positions)", pending.len() / SERIALIZED_LEN);
+        log::info!(
+            "flushing uploader buffer ({} positions)",
+            pending.len() / SERIALIZED_LEN
+        );
         let positions = std::mem::take(&mut pending).freeze();
         cf.client
             .upload_positions(&cf.model_id, positions)
@@ -262,7 +262,11 @@ fn self_play(_idx: usize, cf: AppConfig) {
             let out = search(&cf, board, 0.25, 0.0, monitor);
             cf.total_moves.fetch_add(1, Ordering::Relaxed);
             log.push((board, out.policy.try_into().unwrap()));
-            board = if log.len() < 30 { out.board_sample } else { out.board_best };
+            board = if log.len() < 30 {
+                out.board_sample
+            } else {
+                out.board_best
+            };
         }
         cf.total_games.fetch_add(1, Ordering::Relaxed);
         if let Some(true) = board.win() {

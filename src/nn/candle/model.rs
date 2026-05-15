@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle_core::{DType, Device, ModuleT, Result, Tensor};
 use candle_nn::{
-    BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, Linear, VarBuilder, VarMap,
-    batch_norm, conv2d, linear, ops::log_softmax, ops::leaky_relu,
+    BatchNorm, BatchNormConfig, Conv2d, Conv2dConfig, Linear, VarBuilder, VarMap, batch_norm,
+    conv2d, linear, ops::leaky_relu, ops::log_softmax,
 };
 
 use crate::{
@@ -265,7 +265,13 @@ impl CandleModel {
         value_hidden: usize,
         device: &CandleDevice,
     ) -> CandleModel {
-        Self::build(conv_layers, conv_channels, value_hidden, device, VarMap::new())
+        Self::build(
+            conv_layers,
+            conv_channels,
+            value_hidden,
+            device,
+            VarMap::new(),
+        )
     }
 
     pub(crate) fn build(
