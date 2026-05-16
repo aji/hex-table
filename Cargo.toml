@@ -29,7 +29,7 @@ tokio = { version = "1.52.2", features = ["full"] }
 tqdm = "0.8.0"
 
 [features]
-default = ["nn", "burn"]
+default = []
 ui = ["dep:ggez"]
 nn = []
 burn = ["nn", "dep:burn"]

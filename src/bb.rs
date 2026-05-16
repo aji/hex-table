@@ -217,6 +217,31 @@ const ADJ5_KEEP: u128 = mask(
 
 const NEXT_MOVE: u128 = 0x80000000_00000000_00000000_00000000;
 
+/// Return the bit position of the ith set bit in the given mask
+fn bb_nth_index(mask: u128, mut i: u32) -> u32 {
+    for j in 0..128 {
+        if mask & (1 << j) == 0 {
+            continue;
+        }
+        if i == 0 {
+            return j;
+        } else {
+            i -= 1;
+        }
+    }
+    panic!()
+}
+
+#[test]
+fn test_bb_nth_index() {
+    assert_eq!(bb_nth_index(0b11100, 0), 2);
+    assert_eq!(bb_nth_index(0b11100, 1), 3);
+    assert_eq!(bb_nth_index(0b11100, 2), 4);
+    assert_eq!(bb_nth_index(0b101010, 0), 1);
+    assert_eq!(bb_nth_index(0b101010, 1), 3);
+    assert_eq!(bb_nth_index(0b101010, 2), 5);
+}
+
 fn bb_fill(start: u128, traversable: u128) -> u128 {
     let mut cur = start & traversable;
     loop {
@@ -372,6 +397,43 @@ impl mcts::MctsState for Bitboard {
             .map(|i| (i, self.nth_child(i)))
             .collect::<Vec<_>>()
             .into_iter()
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct ExactMcts(pub Bitboard);
+
+impl mcts::MctsState for ExactMcts {
+    fn init() -> Self {
+        Self(Bitboard::new())
+    }
+
+    fn max_move_count() -> usize {
+        121
+    }
+
+    fn terminal(&self) -> Option<bool> {
+        self.0.win()
+    }
+
+    fn rollout(&self) -> bool {
+        let mut board = self.0;
+        let mut sente = board.sente();
+        let moves_left = (BOARD & !board.black & !board.white).count_ones();
+        for i in 0..moves_left {
+            let m = rand::random_range(0..moves_left - i);
+            let n = bb_nth_index(!board.black & !board.white, m);
+            match sente {
+                true => board.black |= 1 << n,
+                false => board.white |= 1 << n,
+            }
+            sente = !sente;
+        }
+        bb_fill(BLACK_START, board.black) & BLACK_END != 0
+    }
+
+    fn children(&self) -> impl ExactSizeIterator<Item = (usize, Self)> {
+        self.0.children().map(|(i, x)| (i, Self(x)))
     }
 }
 

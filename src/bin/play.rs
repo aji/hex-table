@@ -73,11 +73,10 @@ fn nn_thinking_task(model: &CandleModel, task: ThinkHandle) {
             let elapsed = start.elapsed();
             let aborted = {
                 let mut data = task.data();
-                data.message =
-                    Some(format!("{:>8} sims {:>7.1?}", n, elapsed));
+                data.message = Some(format!("{:>8} sims {:>7.1?}", n, elapsed));
                 data.aborted
             };
-            !aborted && elapsed.as_secs() < 2
+            !aborted && elapsed.as_secs() < 20
         }
     });
     let i = out

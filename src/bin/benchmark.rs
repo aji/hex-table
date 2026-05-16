@@ -10,7 +10,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use hex_table::{
-    bb::Bitboard,
+    bb::{Bitboard, ExactMcts},
     mcts::{self, MctsMonitor, MctsStats},
     nn::{
         candle::model::{CandleDevice, CandleModel},
@@ -120,6 +120,7 @@ struct RankCommand {
 /// `play()` runs one move respecting the deadline.
 struct Strategy {
     model: Option<CandleModel>,
+    exact: bool,
     descriptor: String,
 }
 
@@ -128,19 +129,37 @@ impl Strategy {
         match path {
             None => Ok(Self {
                 model: None,
+                exact: false,
                 descriptor: "mcts".to_string(),
+            }),
+            Some(p) if p.to_str() == Some("mcts-exact") => Ok(Self {
+                model: None,
+                exact: true,
+                descriptor: "mcts-exact".to_string(),
             }),
             Some(p) => Ok(Self {
                 model: Some(load_checkpoint(p, device)?),
+                exact: false,
                 descriptor: format!("model:{}", p.display()),
             }),
         }
     }
 
-    fn play(&self, board: Bitboard, deadline: Instant) -> Bitboard {
+    fn play(&self, board: Bitboard, budget: Duration) -> Bitboard {
+        let start = Instant::now();
         match &self.model {
-            None => mcts::search(board, board.depth(), MctsDeadline(deadline)).best,
+            None => {
+                let deadline = start + budget;
+                if self.exact {
+                    mcts::search(ExactMcts(board), board.depth(), MctsDeadline(deadline))
+                        .best
+                        .0
+                } else {
+                    mcts::search(board, board.depth(), MctsDeadline(deadline)).best
+                }
+            }
             Some(m) => {
+                let deadline = start + budget.max(Duration::from_millis(100));
                 let out = nn_search(m, board, 0.0, 0.0, move |_n: usize| {
                     Instant::now() < deadline
                 });
@@ -175,7 +194,7 @@ struct GameOutcome {
     gote_total: Duration,
 }
 
-const MIN_BUDGET: Duration = Duration::from_millis(100);
+const MIN_BUDGET: Duration = Duration::from_millis(1);
 
 /// Split a suggested handicap into per-turn budgets, symmetrically around
 /// `base_time`. Both budgets are floored at 100 ms, so the *effective*
@@ -215,8 +234,7 @@ fn play_game(
             (gote, gote_budget)
         };
         let start = Instant::now();
-        let deadline = start + budget;
-        let next = strategy.play(board, deadline);
+        let next = strategy.play(board, budget);
         let elapsed = start.elapsed();
         if is_sente {
             sente_total += elapsed;
@@ -312,7 +330,7 @@ fn rank_subject(
     // tails never go to zero.
     let mut ranks = Prior::from_fn(ranks_xs, |x| {
         let uniform = 1.0 / ranks_n as f64;
-        let normal = x.normal(0.0, 1.0) / RANK_SUBUNITS;
+        let normal = x.normal(0.0, 2.0) / RANK_SUBUNITS;
         0.75.lerp(normal, uniform)
     });
 
