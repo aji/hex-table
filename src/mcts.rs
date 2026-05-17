@@ -157,6 +157,14 @@ impl<'a, S: MctsState> MctsNode<'a, S> {
         let x = self.num_wins as f32 / self.num_sims as f32;
         x * 2.0 - 1.0
     }
+
+    fn values(&self) -> Vec<f32> {
+        let mut values = vec![0.0; S::max_move_count()];
+        for x in self.children.as_ref().unwrap().iter() {
+            values[x.action] = 2.0 * (x.num_wins as f32 / x.num_sims as f32) - 1.0;
+        }
+        values
+    }
 }
 
 pub struct MctsStats<S> {
@@ -183,9 +191,11 @@ where
 }
 
 pub struct Output<S> {
+    pub iters: usize,
     pub best: S,
     pub policy: Vec<f32>,
     pub value: f32,
+    pub values: Vec<f32>,
 }
 
 pub fn search<S: MctsState, M: MctsMonitor<S>>(
@@ -224,8 +234,10 @@ pub fn search<S: MctsState, M: MctsMonitor<S>>(
     }
 
     Output {
+        iters: root.num_sims as usize,
         best: root.best(),
         policy: root.policy(),
         value: root.value(),
+        values: root.values(),
     }
 }

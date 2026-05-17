@@ -26,7 +26,7 @@ use crate::{
     },
 };
 
-type Wgpu = burn::backend::Wgpu<f32, i32>;
+type Back = burn::backend::Wgpu<f32, i32>;
 
 #[derive(Clone)]
 struct AppConfig {
@@ -113,7 +113,7 @@ fn spawn_evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
 
 fn evaluator(cf: AppConfig, inbox: Receiver<EvaluatorMsg>) {
     let device = Default::default();
-    let mut model: BurnModel<Wgpu> = match inbox.recv() {
+    let mut model: BurnModel<Back> = match inbox.recv() {
         Ok(EvaluatorMsg::Init(config, data)) => config.init(&device).load_bytes(data),
         _ => panic!("expected an init message"),
     };
@@ -257,6 +257,10 @@ fn self_play(_idx: usize, cf: AppConfig) {
     };
     loop {
         let mut board = Bitboard::new();
+        match rand::random_range(0..122) {
+            121 => (),
+            n => board = board.nth_child(n),
+        };
         let mut log: Vec<(Bitboard, [f32; 121])> = Vec::new();
         while board.win().is_none() {
             let out = search(&cf, board, 0.25, 0.0, monitor);

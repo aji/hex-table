@@ -4,6 +4,7 @@ use std::{
     io::{self, Write},
     ops::ControlFlow,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::LazyLock,
     time::{Duration, Instant},
 };
@@ -103,6 +104,10 @@ struct RankCommand {
     )]
     prior_max: f64,
 
+    /// Initial mean and stddev for the prior.
+    #[arg(long, value_name = "M,S", default_value = "0.0,3.0", value_parser = parse_pair::<f64>)]
+    prior: (f64, f64),
+
     /// Per-turn base time, in seconds. Subject and baseline each get
     /// `base_time * 10^(±handicap/2)` per turn, floored at 100 ms.
     #[arg(long, value_name = "SECONDS", default_value = "1.0")]
@@ -114,6 +119,18 @@ struct RankCommand {
     /// are stale from the old sim-based calibration.
     #[arg(long, value_name = "B0,B1", default_value = "0.3,1.8", value_parser = parse_likelihood)]
     likelihood: Likelihood,
+}
+
+fn parse_pair<T: FromStr>(s: &str) -> Result<(T, T), String>
+where
+    T::Err: std::fmt::Display,
+{
+    let (x0, x1) = s
+        .split_once(',')
+        .ok_or_else(|| format!("expected a,b, got {s:?}"))?;
+    let x0: T = x0.parse().map_err(|e| format!("bad a {x0:?}: {e}"))?;
+    let x1: T = x1.parse().map_err(|e| format!("bad b {x1:?}: {e}"))?;
+    Ok((x0, x1))
 }
 
 /// A baseline or subject in the matchup: an MCTS searcher or a loaded model.
@@ -145,35 +162,73 @@ impl Strategy {
         }
     }
 
-    fn play(&self, board: Bitboard, budget: Duration) -> Bitboard {
+    fn play(&self, board: Bitboard, budget: Duration) -> (Bitboard, usize) {
+        if let Some(board) = board.take_win() {
+            return (board, 1);
+        }
         let start = Instant::now();
         match &self.model {
             None => {
                 let deadline = start + budget;
                 if self.exact {
-                    mcts::search(ExactMcts(board), board.depth(), MctsDeadline(deadline))
-                        .best
-                        .0
+                    let out = mcts::search(ExactMcts(board), board.depth(), MctsDeadline(deadline));
+                    (out.best.0, out.iters)
                 } else {
-                    mcts::search(board, board.depth(), MctsDeadline(deadline)).best
+                    let out = mcts::search(board, board.depth(), MctsDeadline(deadline));
+                    (out.best, out.iters)
                 }
             }
             Some(m) => {
-                let deadline = start + budget.max(Duration::from_millis(100));
-                let out = nn_search(m, board, 0.0, 0.0, move |_n: usize| {
-                    Instant::now() < deadline
+                let deadline = start + budget;
+                let out = nn_search(m, board, 0.0, 0.0, move |n: usize| {
+                    n < 100 || Instant::now() < deadline
                 });
-                let i = out
-                    .policy
-                    .iter()
-                    .copied()
-                    .map(|x| x.powi(4))
-                    .sample_weighted(&mut rand::rng())
-                    .unwrap();
-                board.nth_child(i)
+                (out.board_best, out.iters)
             }
         }
     }
+
+    #[allow(unused)]
+    fn analyze(&self, board: Bitboard) -> Analysis {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(30);
+        match &self.model {
+            None => {
+                if self.exact {
+                    let out = mcts::search(ExactMcts(board), board.depth(), MctsDeadline(deadline));
+                    Analysis {
+                        iters: out.iters,
+                        prior: out.policy,
+                        value: out.values,
+                    }
+                } else {
+                    let out = mcts::search(board, board.depth(), MctsDeadline(deadline));
+                    Analysis {
+                        iters: out.iters,
+                        prior: out.policy,
+                        value: out.values,
+                    }
+                }
+            }
+            Some(m) => {
+                let out = nn_search(m, board, 0.0, 0.0, move |_: usize| {
+                    Instant::now() < deadline
+                });
+                Analysis {
+                    iters: out.iters,
+                    prior: out.policy,
+                    value: out.values,
+                }
+            }
+        }
+    }
+}
+
+#[allow(unused)]
+struct Analysis {
+    iters: usize,
+    prior: Vec<f32>,
+    value: Vec<f32>,
 }
 
 fn expand_subjects(paths: &[PathBuf], device: &CandleDevice) -> io::Result<Vec<Strategy>> {
@@ -190,20 +245,49 @@ fn expand_subjects(paths: &[PathBuf], device: &CandleDevice) -> io::Result<Vec<S
 /// Per-side compute time and outcome of one game.
 struct GameOutcome {
     sente_win: bool,
-    sente_total: Duration,
-    gote_total: Duration,
+    sente_stats: GameStats,
+    gote_stats: GameStats,
+}
+
+impl GameOutcome {
+    fn stats(&self, sente: bool) -> &GameStats {
+        match sente {
+            true => &self.sente_stats,
+            false => &self.gote_stats,
+        }
+    }
+}
+
+struct GameStats {
+    num_plays: usize,
+    total_time: Duration,
+    total_iters: usize,
+}
+
+impl GameStats {
+    fn new() -> GameStats {
+        GameStats {
+            num_plays: 0,
+            total_time: Duration::ZERO,
+            total_iters: 0,
+        }
+    }
 }
 
 const MIN_BUDGET: Duration = Duration::from_millis(1);
 
 /// Split a suggested handicap into per-turn budgets, symmetrically around
-/// `base_time`. Both budgets are floored at 100 ms, so the *effective*
-/// handicap of the game may differ from the suggestion when a side hits the
-/// floor — the rank update uses what actually got played, not what was asked.
-/// Returns `(subject_budget, baseline_budget)`.
+/// `base_time`. Both budgets are floored, and the players do not have to
+/// strictly obey the budget, so the *effective* handicap of the game may differ
+/// from the suggestion. The rank update uses what actually got played, not
+/// what was asked. Returns `(subject_budget, baseline_budget)`.
 fn budgets_from_handicap(suggested: f64, base_time: f64) -> (Duration, Duration) {
-    let subject_secs = base_time * 10.0f64.powf(-suggested / 2.0);
-    let baseline_secs = base_time * 10.0f64.powf(suggested / 2.0);
+    let turn_time = base_time * 2.0;
+    let subj_amt = 10.0f64.powf(-suggested / 2.0);
+    let base_amt = 10.0f64.powf(suggested / 2.0);
+    let total_amt = subj_amt + base_amt;
+    let subject_secs = turn_time * (subj_amt / total_amt);
+    let baseline_secs = turn_time * (base_amt / total_amt);
     let subject = Duration::from_secs_f64(subject_secs).max(MIN_BUDGET);
     let baseline = Duration::from_secs_f64(baseline_secs).max(MIN_BUDGET);
     (subject, baseline)
@@ -215,16 +299,18 @@ fn play_game(
     sente_budget: Duration,
     gote_budget: Duration,
 ) -> GameOutcome {
-    let mut board = Bitboard::new();
-    let mut sente_total = Duration::ZERO;
-    let mut gote_total = Duration::ZERO;
+    // start the game on a random opening move in an attempt to correct for
+    // first-player advantage
+    let mut board = Bitboard::new().nth_child(rand::random_range(0..121));
+    let mut sente_stats = GameStats::new();
+    let mut gote_stats = GameStats::new();
     loop {
         show_game(&board);
         if let Some(win) = board.win() {
             return GameOutcome {
                 sente_win: win,
-                sente_total,
-                gote_total,
+                sente_stats,
+                gote_stats,
             };
         }
         let is_sente = board.sente();
@@ -233,14 +319,15 @@ fn play_game(
         } else {
             (gote, gote_budget)
         };
+
         let start = Instant::now();
-        let next = strategy.play(board, budget);
-        let elapsed = start.elapsed();
-        if is_sente {
-            sente_total += elapsed;
-        } else {
-            gote_total += elapsed;
-        }
+        let (next, iters) = strategy.play(board, budget);
+
+        let stats = if is_sente { &mut sente_stats } else { &mut gote_stats };
+        stats.num_plays += 1;
+        stats.total_iters += iters;
+        stats.total_time += start.elapsed();
+
         board = next;
     }
 }
@@ -296,15 +383,12 @@ fn cmd_rank(cmd: &RankCommand, device: &CandleDevice) -> io::Result<()> {
 
     for subject in &subjects {
         rank_subject(
+            cmd,
             out.as_mut(),
             &baseline,
             subject,
-            cmd.prior_min,
-            cmd.prior_max,
-            cmd.base_time,
             iters_stop,
             stddev_stop,
-            &cmd.likelihood,
         )?;
     }
 
@@ -312,26 +396,21 @@ fn cmd_rank(cmd: &RankCommand, device: &CandleDevice) -> io::Result<()> {
 }
 
 fn rank_subject(
+    cmd: &RankCommand,
     mut out: Option<&mut File>,
     baseline: &Strategy,
     subject: &Strategy,
-    prior_min: f64,
-    prior_max: f64,
-    base_time: f64,
     iters_stop: Option<usize>,
     stddev_stop: Option<f64>,
-    likelihood: &Likelihood,
 ) -> io::Result<()> {
     const RANK_SUBUNITS: f64 = 128.0;
 
-    let ranks_n = ((prior_max - prior_min) * RANK_SUBUNITS + 1.0).round() as usize;
-    let ranks_xs = Linspace::new(prior_min, prior_max, ranks_n);
+    let ranks_n = ((cmd.prior_max - cmd.prior_min) * RANK_SUBUNITS + 1.0).round() as usize;
+    let ranks_xs = Linspace::new(cmd.prior_min, cmd.prior_max, ranks_n);
     // Mild normal at handicap = 0 (equal compute), mixed with uniform so the
     // tails never go to zero.
     let mut ranks = Prior::from_fn(ranks_xs, |x| {
-        let uniform = 1.0 / ranks_n as f64;
-        let normal = x.normal(0.0, 2.0) / RANK_SUBUNITS;
-        0.75.lerp(normal, uniform)
+        x.normal(cmd.prior.0, cmd.prior.1) / RANK_SUBUNITS
     });
 
     log::info!(
@@ -380,7 +459,8 @@ fn rank_subject(
             break;
         }
 
-        let (subject_budget, baseline_budget) = budgets_from_handicap(handicap, base_time);
+        let (subject_budget, baseline_budget) = budgets_from_handicap(handicap, cmd.base_time);
+        log::info!("running game with subject={subject_budget:?} and baseline={baseline_budget:?}");
         let subject_is_sente = iter.is_multiple_of(2);
         let (sente, gote, sente_budget, gote_budget) = if subject_is_sente {
             (subject, baseline, subject_budget, baseline_budget)
@@ -391,21 +471,17 @@ fn rank_subject(
 
         // Effective handicap from the baseline's perspective: positive means
         // baseline actually got more compute than the subject.
-        let baseline_secs = if subject_is_sente {
-            outcome.gote_total.as_secs_f64()
-        } else {
-            outcome.sente_total.as_secs_f64()
-        };
-        let subject_secs = if subject_is_sente {
-            outcome.sente_total.as_secs_f64()
-        } else {
-            outcome.gote_total.as_secs_f64()
-        };
+        let baseline_stats = outcome.stats(!subject_is_sente);
+        let subject_stats = outcome.stats(subject_is_sente);
+        let baseline_secs = baseline_stats.total_time.as_secs_f64();
+        let subject_secs = subject_stats.total_time.as_secs_f64();
         let h_eff = (baseline_secs / subject_secs).log10();
 
         log::info!(
-            "  subject_is_sente={subject_is_sente} h_eff={h_eff:.2} sente_win={}",
+            "  subject_is_sente={subject_is_sente} h_eff={h_eff:.2} sente_win={} it/turn=subj={},base={}",
             outcome.sente_win,
+            subject_stats.total_iters / subject_stats.num_plays,
+            baseline_stats.total_iters / baseline_stats.num_plays
         );
 
         ranks.update(|x| {
@@ -414,7 +490,7 @@ fn rank_subject(
             // this game over the balanced point is (h_eff - x), translating
             // into a signed sente_advantage that depends on who was sente.
             let sente_advantage = if subject_is_sente { x - h_eff } else { h_eff - x };
-            let p = p_sente_win(likelihood, sente_advantage);
+            let p = p_sente_win(&cmd.likelihood, sente_advantage);
             if outcome.sente_win { p } else { 1.0 - p }
         });
     }
@@ -524,7 +600,7 @@ impl Prior {
             .chunks_exact(chunk_size)
             .map(|x| x.iter().copied().sum::<f64>() / (chunk_size as f64 * max))
             .collect::<Vec<_>>();
-        let rows = 2;
+        let rows = 3;
         for r in 0..rows {
             for y in scaled.iter().copied() {
                 let y0 = (rows - r - 1) as f64 / rows as f64;

@@ -20,7 +20,7 @@ use crate::nn::burn::{
     },
 };
 
-type Wgpu = burn::backend::Autodiff<burn::backend::Wgpu<f32, i32>>;
+type Back = burn::backend::Autodiff<burn::backend::NdArray<f32, i32>>;
 
 #[derive(Clone)]
 struct AppConfig {
@@ -98,11 +98,11 @@ fn optimizer(cf: AppConfig) {
         .unwrap_or_else(TrainError::unrecoverable)
         .into_data()
         .expect("fetch without etag should always return data");
-    let mut model: BurnModel<Wgpu> = config.init(&device).load_bytes(data);
+    let mut model: BurnModel<Back> = config.init(&device).load_bytes(data);
     let mut optim = SgdConfig::new()
         .with_momentum(Some(MomentumConfig::new().with_momentum(cf.momentum)))
         .with_weight_decay(Some(WeightDecayConfig::new(1e-4)))
-        .init::<Wgpu, BurnModel<Wgpu>>();
+        .init::<Back, BurnModel<Back>>();
 
     let mut last_upload = Instant::now();
     let mut loss_total = 0.0;

@@ -1,4 +1,4 @@
 {
   "rust-analyzer.cargo.noDefaultFeatures": true,
-  "rust-analyzer.cargo.features": ["nn", "candle", "candle-metal"]
+  "rust-analyzer.cargo.features": ["nn", "burn", "candle", "candle-metal"]
 }

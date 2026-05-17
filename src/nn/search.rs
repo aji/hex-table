@@ -32,6 +32,7 @@ pub trait Evaluator {
 }
 
 pub struct Output {
+    pub iters: usize,
     pub board_sample: Bitboard,
     pub board_best: Bitboard,
     pub policy: Vec<f32>,
@@ -296,6 +297,7 @@ pub fn search<E: Evaluator, M: Monitor>(
         .argmax()
         .expect("root has no children");
     Output {
+        iters: tree.root_visits,
         board_sample: board.nth_child(sample),
         board_best: board.nth_child(best),
         policy,

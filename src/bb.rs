@@ -372,6 +372,16 @@ impl Bitboard {
         self.white ^= NEXT_MOVE;
         self
     }
+
+    pub fn take_win(self) -> Option<Bitboard> {
+        let sente = self.sente();
+        for i in 0..121 {
+            if self.nth_child_valid(i) && self.nth_child(i).win() == Some(sente) {
+                return Some(self.nth_child(i));
+            }
+        }
+        None
+    }
 }
 
 impl mcts::MctsState for Bitboard {
